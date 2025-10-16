@@ -1,0 +1,194 @@
+{
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2640,
+        -1184
+      ],
+      "id": "dee5c5a0-dd57-479f-9e2e-d07840b670d8",
+      "name": "Start"
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.microsoft.com/v1.0/users/{{$json.USER_UPN}}/mailFolders",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$top",
+              "value": "100"
+            },
+            {
+              "name": "$select",
+              "value": "id,displayName,totalItemCount,unreadItemCount,childFolderCount,childFolders"
+            },
+            {
+              "name": "$expand",
+              "value": "childFolders($select=id,displayName,totalItemCount,unreadItemCount,childFolderCount)"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2320,
+        -1184
+      ],
+      "id": "3113917f-e30c-4896-aa9d-8168f579ddee",
+      "name": "get_folders",
+      "credentials": {
+        "oAuth2Api": {
+          "id": "wINgbOJ2X4ZzA7NV",
+          "name": "Graph Outlook"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process folders AND their children from single API response\nconst response = $json;\nconst allFolders = [];\n\n// Process main folders and their children\nfor (const folder of response.value || []) {\n  // Add main folder\n  allFolders.push({\n    folder_id: folder.id,\n    display_name: folder.displayName,\n    parent_folder_id: null,\n    folder_path: folder.displayName,\n    total_item_count: folder.totalItemCount || 0,\n    unread_item_count: folder.unreadItemCount || 0,\n    child_folder_count: folder.childFolderCount || 0,\n    is_hidden: false,\n    level: 0\n  });\n  \n  // Add child folders if they exist\n  if (folder.childFolders && folder.childFolders.length > 0) {\n    for (const child of folder.childFolders) {\n      allFolders.push({\n        folder_id: child.id,\n        display_name: child.displayName,\n        parent_folder_id: folder.id,\n        folder_path: `${folder.displayName}/${child.displayName}`,\n        total_item_count: child.totalItemCount || 0,\n        unread_item_count: child.unreadItemCount || 0,\n        child_folder_count: child.childFolderCount || 0,\n        is_hidden: false,\n        level: 1\n      });\n      \n      // Jos alikansioilla on vielä omia alikansioita, \n      // ne pitää hakea erikseen (Graph ei tue syvempää expandia)\n      if (child.childFolderCount > 0) {\n        console.log(`NOTE: ${child.displayName} has ${child.childFolderCount} sub-children - need separate call`);\n      }\n    }\n  }\n}\n\n// Sort by message count\nallFolders.sort((a, b) => b.total_item_count - a.total_item_count);\n\n// Statistics\nconst totalMessages = allFolders.reduce((sum, f) => sum + f.total_item_count, 0);\nconst mainFolders = allFolders.filter(f => f.level === 0).length;\nconst subFolders = allFolders.filter(f => f.level === 1).length;\n\n// Find important folders\nconst importantFolders = [\n  'Bloomberg', 'SA', 'Inderes', 'Sijoitukset', \n  'Laskut', 'Sopimukset', 'Arkisto'\n];\n\nconst foundImportant = allFolders.filter(f => \n  importantFolders.some(imp => \n    f.display_name.toLowerCase().includes(imp.toLowerCase())\n  )\n);\n\nreturn [{\n  json: {\n    summary: {\n      total_folders: allFolders.length,\n      main_folders: mainFolders,\n      sub_folders: subFolders,\n      total_messages: totalMessages,\n      timestamp: new Date().toISOString()\n    },\n    folders: allFolders,\n    top_10: allFolders.slice(0, 10).map(f => ({\n      name: f.display_name,\n      path: f.folder_path,\n      count: f.total_item_count,\n      id: f.folder_id\n    })),\n    important: foundImportant.map(f => ({\n      name: f.display_name,\n      count: f.total_item_count\n    }))\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2160,
+        -1184
+      ],
+      "id": "d7a324a5-9dd9-4c42-a308-fa34e9c66a05",
+      "name": "process"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Clear old data\nTRUNCATE outlook.folders_cache;\n\n-- Insert folders\nINSERT INTO outlook.folders_cache (\n  folder_id,\n  display_name,\n  parent_folder_id,\n  folder_path,\n  total_item_count,\n  unread_item_count,\n  child_folder_count,\n  is_hidden,\n  created_at,\n  updated_at\n)\nSELECT \n  folder->>'folder_id',\n  folder->>'display_name',\n  folder->>'parent_folder_id',\n  folder->>'folder_path',\n  (folder->>'total_item_count')::int,\n  (folder->>'unread_item_count')::int,\n  (folder->>'child_folder_count')::int,\n  false,\n  NOW(),\n  NOW()\nFROM jsonb_array_elements($1::jsonb) AS folder;\n\n-- Return result\nSELECT \n  COUNT(*) as folders_saved,\n  SUM(total_item_count) as total_messages\nFROM outlook.folders_cache;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.folders) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -2000,
+        -1184
+      ],
+      "id": "d13b764b-a983-408b-a923-828ce45b1839",
+      "name": "save_db",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "TENANT_ID",
+              "value": "e361cf6f-2864-4bb4-9403-d75fd4ffa70e"
+            },
+            {
+              "name": "USER_UPN",
+              "value": "jouni.pappila@repoxcapital.fi"
+            },
+            {
+              "name": "CLIENT_STATE",
+              "value": "n8n_graph_14O7_7539"
+            },
+            {
+              "name": "MAIL_RESOURCE",
+              "value": "users/jouni.pappila@repoxcapital.fi/messages"
+            },
+            {
+              "name": "WEBHOOK_PUBLIC_URL",
+              "value": "https://rxjp.app.n8n.cloud/webhook/graph/mail"
+            },
+            {
+              "name": "GRAPH_BASE",
+              "value": "https://graph.microsoft.com/v1.0"
+            },
+            {
+              "name": "START_DAYS_BACK",
+              "value": "30"
+            }
+          ],
+          "number": [
+            {
+              "name": "BATCH_SIZE",
+              "value": 50
+            }
+          ]
+        },
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        -2480,
+        -1184
+      ],
+      "id": "b44902fa-6e6a-4068-8da8-7570a51bb939",
+      "name": "set_config"
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "set_config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_folders": {
+      "main": [
+        [
+          {
+            "node": "process",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "process": {
+      "main": [
+        [
+          {
+            "node": "save_db",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "set_config": {
+      "main": [
+        [
+          {
+            "node": "get_folders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "5bc588890427261aec904f1de6ea2c47f92f0021d7680fbf9bd2043a6f4924b2"
+  }
+}

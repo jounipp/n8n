@@ -110,6 +110,21 @@ CREATE TABLE outlook.classification_rules (
   notes text,
   CONSTRAINT classification_rules_pkey PRIMARY KEY (id)
 );
+CREATE TABLE outlook.contact_lists (
+  id integer NOT NULL DEFAULT nextval('outlook.contact_lists_id_seq'::regclass),
+  list_type text NOT NULL CHECK (list_type = ANY (ARRAY['vip_finance'::text, 'vip_personal'::text, 'personal'::text, 'business_critical'::text, 'internal'::text])),
+  identifier_type text NOT NULL CHECK (identifier_type = ANY (ARRAY['from_domain'::text, 'from_address'::text, 'from_address_contains'::text, 'message_id_domain'::text, 'list_domain'::text, 'unsub_domain'::text])),
+  identifier_value text NOT NULL,
+  target_category text NOT NULL CHECK (target_category = ANY (ARRAY['business_critical'::text, 'personal_communication'::text, 'financial_news'::text, 'marketing'::text, 'notifications'::text, 'industry_news'::text, 'internal'::text, 'regulatory'::text, 'spam_low_value'::text, 'uncategorized'::text])),
+  recommended_action text DEFAULT 'review'::text CHECK (recommended_action = ANY (ARRAY['none'::text, 'read'::text, 'review'::text, 'follow_up'::text, 'urgent'::text, 'archive'::text, 'delete'::text])),
+  priority integer DEFAULT 20 CHECK (priority >= 10 AND priority <= 40),
+  notes text,
+  is_active boolean DEFAULT true,
+  created_at timestamp with time zone DEFAULT now(),
+  updated_at timestamp with time zone DEFAULT now(),
+  created_by text,
+  CONSTRAINT contact_lists_pkey PRIMARY KEY (id)
+);
 CREATE TABLE outlook.content_analysis (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   message_id text NOT NULL UNIQUE,
