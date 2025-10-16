@@ -1,0 +1,339 @@
+{
+  "name": "Outlook Gateway Enhanced",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "outlook-gateway",
+        "options": {}
+      },
+      "id": "webhook-trigger-001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [250, 300],
+      "webhookId": "outlook-gateway-webhook"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Load all active classification rules with metrics\n-- Ordered by priority for first-match-wins logic\nSELECT \n  r.id as rule_id,\n  r.version,\n  r.feature,\n  r.key_value,\n  r.target_category,\n  r.recommended_action,\n  r.priority,\n  r.scope,\n  COALESCE(rm.precision_cat_pct, 95) as precision_cat_pct,\n  COALESCE(rm.precision_action_pct, 80) as precision_action_pct,\n  COALESCE(rm.support, 0) as support,\n  COALESCE(rm.avg_relevance_pct, 50) as avg_relevance_pct\nFROM outlook.classification_rules r\nLEFT JOIN outlook.classification_rule_metrics rm ON r.id = rm.rule_id\nWHERE r.is_active = TRUE\n  AND r.rule_type = 'single'\nORDER BY r.priority ASC, rm.support DESC, r.feature ASC",
+        "options": {
+          "queryBatching": "all"
+        }
+      },
+      "id": "load-rules-001",
+      "name": "load_active_rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [450, 300],
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Process each email through rule engine\nconst email = $input.item.json.email || $input.item.json;\nconst rules = $('load_active_rules').all().map(r => r.json);\n\n// Feature extraction functions\nfunction normalizeEmail(addr) {\n  if (!addr) return null;\n  addr = String(addr).toLowerCase().trim();\n  \n  // Remove display name if present\n  const emailMatch = addr.match(/<([^>]+)>/);\n  if (emailMatch) addr = emailMatch[1];\n  \n  // Remove + tag\n  if (addr.includes('@')) {\n    const [localPart, domain] = addr.split('@');\n    const cleanLocal = localPart.split('+')[0];\n    return `${cleanLocal}@${domain}`;\n  }\n  return addr;\n}\n\nfunction extractDomain(email) {\n  if (!email) return null;\n  const normalized = normalizeEmail(email);\n  if (!normalized || !normalized.includes('@')) return null;\n  return normalized.split('@')[1];\n}\n\nfunction extractMessageIdDomain(header) {\n  if (!header) return null;\n  const match = header.match(/@([^>]+)>?/);\n  return match ? match[1].toLowerCase() : null;\n}\n\nfunction extractListDomain(listId) {\n  if (!listId) return null;\n  const match = listId.match(/<([^>]+)>/);\n  return match ? match[1].toLowerCase() : null;\n}\n\nfunction extractUnsubDomain(unsubLink) {\n  if (!unsubLink) return null;\n  \n  // Try HTTP/HTTPS first\n  let match = unsubLink.match(/https?:\\/\\/([^\\/>,;\\s]+)/);\n  if (match) return match[1].toLowerCase();\n  \n  // Try mailto\n  match = unsubLink.match(/mailto:.*@([^>,;\\s]+)/);\n  if (match) return match[1].toLowerCase();\n  \n  // Try plain email\n  match = unsubLink.match(/@([^>,;\\s]+)/);\n  if (match) return match[1].toLowerCase();\n  \n  return null;\n}\n\n// Extract return_path from headers if available\nfunction extractReturnPath(headers) {\n  if (!headers) return null;\n  \n  // If headers is a JSON string, parse it\n  if (typeof headers === 'string') {\n    try {\n      headers = JSON.parse(headers);\n    } catch (e) {\n      return null;\n    }\n  }\n  \n  // Look for return_path in headers\n  if (headers.return_path) {\n    return normalizeEmail(headers.return_path);\n  }\n  \n  return null;\n}\n\n// Build feature set from email\nconst features = {\n  from_address: normalizeEmail(email.from_address),\n  sender_address: normalizeEmail(email.sender_address),\n  reply_to_address: normalizeEmail(email.reply_to_address),\n  from_domain: email.from_domain?.toLowerCase() || extractDomain(email.from_address),\n  message_id_domain: extractMessageIdDomain(email.message_id_header),\n  list_domain: extractListDomain(email.list_id),\n  unsub_domain: extractUnsubDomain(email.unsubscribe_link),\n  precedence: email.precedence?.toLowerCase(),\n  auto_submitted: email.auto_submitted?.toLowerCase(),\n  return_path: extractReturnPath(email.headers)\n};\n\n// Apply rules - first match wins\nlet bestMatch = null;\nconst allMatches = [];\n\nfor (const rule of rules) {\n  const featureValue = features[rule.feature];\n  \n  if (featureValue && featureValue === rule.key_value) {\n    const match = {\n      rule_id: rule.rule_id,\n      version: rule.version,\n      feature: rule.feature,\n      key_value: rule.key_value,\n      target_category: rule.target_category,\n      recommended_action: rule.recommended_action || 'review',\n      priority: rule.priority,\n      precision_cat_pct: rule.precision_cat_pct,\n      precision_action_pct: rule.precision_action_pct,\n      support: rule.support,\n      relevance: rule.avg_relevance_pct\n    };\n    \n    allMatches.push(match);\n    \n    // First match wins (already sorted by priority)\n    if (!bestMatch) {\n      bestMatch = match;\n    }\n  }\n}\n\n// Calculate priority score based on rule priority and confidence\nfunction calculatePriorityScore(priority, precision, relevance) {\n  // Base score from priority level\n  let score = priority === 10 ? 80 : priority === 20 ? 60 : 40;\n  \n  // Adjust based on precision\n  if (precision >= 95) score += 10;\n  else if (precision >= 90) score += 5;\n  \n  // Adjust based on relevance\n  if (relevance >= 80) score += 5;\n  \n  return Math.min(100, score);\n}\n\n// Build response\nif (bestMatch) {\n  return {\n    matched: true,\n    message_id: email.message_id,\n    subject: email.subject,\n    from_address: email.from_address,\n    received_datetime: email.received_datetime,\n    features_extracted: features,\n    decision: {\n      primary_category: bestMatch.target_category,\n      recommended_action: bestMatch.recommended_action,\n      confidence: bestMatch.precision_cat_pct,\n      priority_score: calculatePriorityScore(\n        bestMatch.priority,\n        bestMatch.precision_cat_pct,\n        bestMatch.relevance\n      ),\n      requires_deep_analysis: false\n    },\n    rule_match: {\n      rule_id: bestMatch.rule_id,\n      version: bestMatch.version,\n      feature: bestMatch.feature,\n      key_value: bestMatch.key_value,\n      priority: bestMatch.priority,\n      support: bestMatch.support\n    },\n    all_matches: allMatches,\n    classification_source: 'rule',\n    processing_time_ms: Date.now() - (email.processing_start || Date.now())\n  };\n} else {\n  return {\n    matched: false,\n    message_id: email.message_id,\n    subject: email.subject,\n    from_address: email.from_address,\n    received_datetime: email.received_datetime,\n    features_extracted: features,\n    features_checked: Object.keys(features).filter(k => features[k]),\n    classification_source: 'needs_ai',\n    reason: 'no_matching_rules'\n  };\n}"
+      },
+      "id": "apply-rules-001",
+      "name": "apply_rules_engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.matched }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "router-001",
+      "name": "Route by match",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Save rule-based decision to database\nconst item = $input.item.json;\n\n// Build SQL values\nconst values = {\n  message_id: item.message_id,\n  model_name: 'rule_engine',\n  model_version: item.rule_match.version,\n  primary_category: item.decision.primary_category,\n  recommended_action: item.decision.recommended_action,\n  confidence: item.decision.confidence,\n  priority_score: item.decision.priority_score,\n  rule_conditions: `${item.rule_match.feature}:${item.rule_match.key_value}`,\n  reasons: [\n    `Matched rule: ${item.rule_match.feature}`,\n    `Key: ${item.rule_match.key_value}`,\n    `Support: ${item.rule_match.support} emails`,\n    `Precision: ${item.decision.confidence}%`\n  ],\n  requires_deep_analysis: false,\n  decided_at: new Date().toISOString()\n};\n\nreturn values;"
+      },
+      "id": "prepare-save-001",
+      "name": "prepare_save_data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 200]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Upsert rule-based classification\nINSERT INTO outlook.email_interest (\n  message_id,\n  model_name,\n  model_version,\n  primary_category,\n  recommended_action,\n  confidence,\n  priority_score,\n  rule_conditions,\n  reasons,\n  requires_deep_analysis,\n  decided_at,\n  status\n) VALUES (\n  '{{ $json.message_id }}',\n  '{{ $json.model_name }}',\n  '{{ $json.model_version }}',\n  '{{ $json.primary_category }}',\n  '{{ $json.recommended_action }}',\n  {{ $json.confidence }},\n  {{ $json.priority_score }},\n  '{{ $json.rule_conditions }}',\n  ARRAY[{{ $json.reasons.map(r => `'${r}'`).join(',') }}],\n  {{ $json.requires_deep_analysis }},\n  '{{ $json.decided_at }}'::timestamptz,\n  'accepted'\n)\nON CONFLICT (message_id) \nDO UPDATE SET\n  model_name = EXCLUDED.model_name,\n  model_version = EXCLUDED.model_version,\n  primary_category = EXCLUDED.primary_category,\n  recommended_action = EXCLUDED.recommended_action,\n  confidence = EXCLUDED.confidence,\n  priority_score = EXCLUDED.priority_score,\n  rule_conditions = EXCLUDED.rule_conditions,\n  reasons = EXCLUDED.reasons,\n  requires_deep_analysis = EXCLUDED.requires_deep_analysis,\n  updated_at = NOW(),\n  status = 'accepted'\nRETURNING message_id, primary_category, recommended_action;",
+        "options": {
+          "queryBatching": "all"
+        }
+      },
+      "id": "save-decision-001",
+      "name": "save_rule_decision",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1250, 200],
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Mark emails as analyzed\nUPDATE outlook.emails_ingest\nSET \n  analyzed_at = NOW(),\n  auto_processed = TRUE\nWHERE message_id IN (\n  {{ $items().map(item => `'${item.json.message_id}'`).join(',') }}\n)\nRETURNING message_id, analyzed_at;",
+        "options": {
+          "queryBatching": "all"
+        }
+      },
+      "id": "mark-analyzed-001",
+      "name": "mark_emails_analyzed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1450, 200],
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Log rule application for monitoring\nINSERT INTO outlook.process_log (\n  process_name,\n  process_type,\n  status,\n  items_processed,\n  metadata,\n  created_at\n) VALUES (\n  'gateway_rule_application',\n  'classification',\n  'success',\n  {{ $items().length }},\n  jsonb_build_object(\n    'total_emails', {{ $items().length }},\n    'rule_matched', {{ $items().filter(i => i.json.matched).length }},\n    'sent_to_ai', {{ $items().filter(i => !i.json.matched).length }},\n    'categories', jsonb_build_object(\n      {{ $items().filter(i => i.json.matched).reduce((acc, item) => {\n        const cat = item.json.decision.primary_category;\n        acc[cat] = (acc[cat] || 0) + 1;\n        return acc;\n      }, {}) }}\n    )\n  ),\n  NOW()\n);",
+        "options": {}
+      },
+      "id": "log-metrics-001",
+      "name": "log_metrics",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1650, 200],
+      "continueOnFail": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format successful response\nconst results = $items().map(item => ({\n  message_id: item.json.message_id,\n  classified: true,\n  category: item.json.primary_category,\n  action: item.json.recommended_action,\n  source: 'rule'\n}));\n\nreturn {\n  success: true,\n  processed: results.length,\n  results: results,\n  timestamp: new Date().toISOString()\n};"
+      },
+      "id": "format-success-001",
+      "name": "format_success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1850, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare emails for AI processing\nconst needsAI = $items().map(item => ({\n  message_id: item.json.message_id,\n  email: {\n    message_id: item.json.message_id,\n    subject: item.json.subject,\n    from_address: item.json.from_address,\n    received_datetime: item.json.received_datetime,\n    features_checked: item.json.features_checked\n  },\n  reason: item.json.reason,\n  gateway_checked: true\n}));\n\nreturn needsAI;"
+      },
+      "id": "prepare-ai-001",
+      "name": "prepare_for_ai",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 400]
+    },
+    {
+      "parameters": {
+        "workflowId": "={{ $parameter.ai_workflow_id || 'outlook-validate-analyse' }}",
+        "options": {}
+      },
+      "id": "call-ai-001",
+      "name": "call_ai_workflow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [1250, 400],
+      "notesInFlow": true,
+      "notes": "Calls Outlook Validate Analyse workflow"
+    },
+    {
+      "parameters": {
+        "content": "## Gateway Configuration\n\n### Priority Levels\n- **10**: Exact addresses (from, sender, reply-to)\n- **20**: Header domains (message-id, list, unsub)\n- **30**: From domain\n- **40**: Return path (reserved)\n\n### Current Rules\n- 34 active single rules\n- ~23% email coverage\n- 95-100% precision\n\n### Performance\n- Rule match: ~50ms\n- AI fallback: 3-5s\n- Cost saving: ~25%",
+        "height": 280,
+        "width": 250
+      },
+      "id": "note-001",
+      "name": "Config Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [180, 100]
+    },
+    {
+      "parameters": {},
+      "id": "manual-trigger-001",
+      "name": "Manual Test",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [250, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Test data with real examples\nreturn [\n  {\n    email: {\n      message_id: \"test-inderes-001\",\n      from_address: \"noreply@mail.inderes.com\",\n      from_domain: \"mail.inderes.com\",\n      subject: \"Aamukatsaus 14.10. - Markkinat nousussa\",\n      message_id_header: \"<20241014123456@newsletter.inderes.fi>\",\n      list_id: \"<30b8ff5109d76134b3751dcc5.255309.list-id.mcsv.net>\",\n      unsubscribe_link: \"https://inderes.us10.list-manage.com/unsubscribe?u=abc&id=123\",\n      received_datetime: new Date().toISOString(),\n      processing_start: Date.now()\n    }\n  },\n  {\n    email: {\n      message_id: \"test-shark-001\",\n      from_address: \"Niina Vuorinen <niina.vuorinen@sharkaccount.fi>\",\n      from_domain: \"sharkaccount.fi\",\n      subject: \"Q3 2024 talousraportti valmis tarkastettavaksi\",\n      received_datetime: new Date().toISOString(),\n      processing_start: Date.now()\n    }\n  },\n  {\n    email: {\n      message_id: \"test-ms-001\",\n      from_address: \"quarantine@messaging.microsoft.com\",\n      from_domain: \"messaging.microsoft.com\",\n      subject: \"Quarantine summary for jouni.pappila@repoxcapital.fi\",\n      received_datetime: new Date().toISOString(),\n      processing_start: Date.now()\n    }\n  },\n  {\n    email: {\n      message_id: \"test-unknown-001\",\n      from_address: \"newsletter@bloomberg.com\",\n      from_domain: \"bloomberg.com\",\n      subject: \"Markets Update: Fed Decision Tomorrow\",\n      received_datetime: new Date().toISOString(),\n      processing_start: Date.now()\n    }\n  },\n  {\n    email: {\n      message_id: \"test-thermia-001\",\n      from_address: \"onlineadmin@thermia.com\",\n      from_domain: \"thermia.com\",\n      subject: \"Your monthly energy report\",\n      message_id_header: \"<abc123@message-id.smtpcorp.com>\",\n      received_datetime: new Date().toISOString(),\n      processing_start: Date.now()\n    }\n  }\n];"
+      },
+      "id": "test-generator-001",
+      "name": "generate_test_emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 500]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "load_active_rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "load_active_rules": {
+      "main": [
+        [
+          {
+            "node": "apply_rules_engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "apply_rules_engine": {
+      "main": [
+        [
+          {
+            "node": "Route by match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by match": {
+      "main": [
+        [
+          {
+            "node": "prepare_save_data",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "prepare_for_ai",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prepare_save_data": {
+      "main": [
+        [
+          {
+            "node": "save_rule_decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "save_rule_decision": {
+      "main": [
+        [
+          {
+            "node": "mark_emails_analyzed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "mark_emails_analyzed": {
+      "main": [
+        [
+          {
+            "node": "log_metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "log_metrics": {
+      "main": [
+        [
+          {
+            "node": "format_success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prepare_for_ai": {
+      "main": [
+        [
+          {
+            "node": "call_ai_workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Test": {
+      "main": [
+        [
+          {
+            "node": "generate_test_emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "generate_test_emails": {
+      "main": [
+        [
+          {
+            "node": "load_active_rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "gateway-enhanced-v1.0",
+  "id": "outlook-gateway-enhanced",
+  "meta": {
+    "instanceId": "n8n-outlook"
+  },
+  "tags": ["outlook", "classification", "rules", "gateway"]
+}

@@ -1,0 +1,250 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -2128,
+        -608
+      ],
+      "id": "4f251de5-fb08-47da-acf0-be49b32e61c3",
+      "name": "Start"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- PostgreSQL node: fetch_email_from_db\n\nSELECT \n  e.message_id,\n  e.internet_message_id,\n  e.from_address,\n  e.from_domain,\n  e.subject,\n  e.user_upn\nFROM outlook.emails_ingest e\nWHERE e.message_id = $1\n  AND e.is_deleted = FALSE\nLIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ [$json.message_id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -1968,
+        -608
+      ],
+      "id": "c3e51629-1e1b-41ab-a517-6bd261fb6cfb",
+      "name": "fetch_email_from_db",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Mode: Run Once for All Items\nconst rows = $input.all();\nif (!rows.length) throw new Error('fetch_email_from_db palautti 0 riviä');\n\nconst email = rows[0].json;\nconst decision = $('Start').first().json || {};\n\nconst messageId = email.message_id;\nconst userUpn   = email.user_upn;\nif (!messageId || !userUpn) throw new Error('message_id tai user_upn puuttuu');\n\n// categories\nconst catsRaw = Array.isArray(decision.outlook_categories) ? decision.outlook_categories : [];\nconst outlookCategories = (catsRaw.length ? catsRaw : ['Passive Monitor'])\n  .map(s => String(s).trim()).filter(Boolean);\n\n// flag – ei null-kenttiä\nlet flag = { flagStatus: (decision.outlook_flag_status || 'notFlagged') };\nif (flag.flagStatus === 'flagged') {\n  const now = new Date().toISOString();\n  const due = new Date(Date.now() + 24*60*60*1000).toISOString();\n  flag = {\n    flagStatus: 'flagged',\n    startDateTime: { dateTime: now, timeZone: 'UTC' },\n    dueDateTime:   { dateTime: due, timeZone: 'UTC' }\n  };\n} else if (flag.flagStatus === 'complete') {\n  const done = new Date().toISOString();\n  flag = { flagStatus: 'complete', completedDateTime: { dateTime: done, timeZone: 'UTC' } };\n}\n\nconst outlookImportance = (decision.outlook_importance || 'normal'); // low|normal|high\n\n// Graph URL (koodaa segmentit)\nconst graphUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(userUpn)}/messages/${encodeURIComponent(messageId)}`;\n\n// Yhdistetty PATCH-body OBJEKTINA (ei stringiä)\nconst combined_payload = {\n  categories: outlookCategories,\n  importance: outlookImportance,\n  flag\n};\n\nreturn [{\n  json: {\n    message_id: messageId,\n    user_upn: userUpn,\n    from_domain: email.from_domain,\n    subject: email.subject,\n    attention_tier: decision.attention_tier || 'B',\n    outlook_categories: outlookCategories,\n    outlook_flag_status: flag.flagStatus,\n    outlook_importance: outlookImportance,\n    graph_url: graphUrl,\n    combined_payload\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1776,
+        -608
+      ],
+      "id": "71f48ac8-536b-4e63-a015-005829f112cc",
+      "name": "build_sync_payloads"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $json.graph_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.combined_payload) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1600,
+        -608
+      ],
+      "id": "ef139d48-f342-4a7d-80f8-91f312676aee",
+      "name": "set_outlook_properties",
+      "credentials": {
+        "oAuth2Api": {
+          "id": "wINgbOJ2X4ZzA7NV",
+          "name": "Graph Outlook"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH src AS (\n  SELECT\n    $1::varchar  AS message_id,\n    $2::varchar  AS attention_tier,\n    ARRAY(SELECT jsonb_array_elements_text($3::jsonb))::text[] AS outlook_categories,\n    $4::varchar  AS outlook_flag_status,\n    $5::varchar  AS outlook_importance,\n    $6::jsonb    AS outlook_state_snapshot,\n    NOW()        AS now_ts\n),\nparent AS (\n  SELECT e.message_id FROM outlook.emails_ingest e JOIN src s USING (message_id)\n)\nINSERT INTO outlook.action_decisions (\n  message_id, attention_tier, outlook_categories,\n  outlook_flag_status, outlook_importance,\n  sync_status, synced_to_outlook_at, outlook_state_snapshot,\n  created_at, updated_at\n)\nSELECT\n  p.message_id, s.attention_tier, s.outlook_categories,\n  s.outlook_flag_status, s.outlook_importance,\n  'synced', s.now_ts, s.outlook_state_snapshot,\n  s.now_ts, s.now_ts\nFROM src s JOIN parent p USING (message_id)\nON CONFLICT (message_id) DO UPDATE SET\n  attention_tier         = EXCLUDED.attention_tier,\n  outlook_categories     = EXCLUDED.outlook_categories,\n  outlook_flag_status    = EXCLUDED.outlook_flag_status,\n  outlook_importance     = EXCLUDED.outlook_importance,\n  sync_status            = 'synced',\n  synced_to_outlook_at   = EXCLUDED.synced_to_outlook_at,\n  outlook_state_snapshot = EXCLUDED.outlook_state_snapshot,\n  updated_at             = EXCLUDED.updated_at\nRETURNING message_id, outlook_categories, synced_to_outlook_at;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.message_id,                               // $1\n  $json.attention_tier,                           // $2\n  JSON.stringify($json.outlook_categories_json),  // $3  JS array -> JSON\n  $json.outlook_flag_status,                      // $4\n  $json.outlook_importance,                       // $5\n  JSON.stringify($json.outlook_state)             // $6\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -1232,
+        -608
+      ],
+      "id": "ff9a630e-7147-4589-8dcc-2af6934b791d",
+      "name": "update_action_decisions",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const build = $('build_sync_payloads').first().json;\nif (!build) throw new Error('build_sync_payloads ei tuottanut dataa');\n\nconst cats = Array.isArray(build.outlook_categories) && build.outlook_categories.length\n  ? build.outlook_categories.map(s => String(s).trim()).filter(Boolean)\n  : ['Passive Monitor'];\n\nreturn [{\n  json: {\n    message_id: build.message_id,\n    attention_tier: build.attention_tier || 'B',\n    outlook_categories_json: cats,                 // JS-array\n    outlook_flag_status: build.outlook_flag_status || 'notFlagged',\n    outlook_importance: build.outlook_importance || 'normal',\n    outlook_state: { synced_at: new Date().toISOString() }\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1424,
+        -608
+      ],
+      "id": "dd39abcf-f09e-4361-8735-3c74ca5faf65",
+      "name": "prepare_db_params"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- PostgreSQL node: log_to_sync_log\n\nINSERT INTO outlook.sync_log (\n  message_id,\n  sync_direction,\n  sync_type,\n  sync_status,\n  outlook_state,\n  db_state,\n  changes_made,\n  synced_at,\n  created_at\n)\nVALUES (\n  $1,\n  'db_to_outlook',\n  'category_update',\n  'synced',\n  $2::jsonb,\n  $3::jsonb,\n  $4::jsonb,\n  NOW(),\n  NOW()\n)\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.message_id,\n  JSON.stringify({\n    categories: $('set_outlook_properties').first().json.categories || [],\n    importance: $('set_outlook_properties').first().json.importance || 'normal',\n    flag: $('set_outlook_properties').first().json.flag || {}\n  }),\n  JSON.stringify({\n    attention_tier: $json.attention_tier,\n    outlook_categories: $json.outlook_categories_json\n  }),\n  JSON.stringify({\n    categories_set: $json.outlook_categories_json,\n    importance_set: $json.outlook_importance,\n    flag_set: $json.outlook_flag_status\n  })\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -1056,
+        -608
+      ],
+      "id": "c35f7aad-f717-4e7c-b870-2f194514ee61",
+      "name": "log_to_sync_log",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      },
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "fetch_email_from_db",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "fetch_email_from_db": {
+      "main": [
+        [
+          {
+            "node": "build_sync_payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "build_sync_payloads": {
+      "main": [
+        [
+          {
+            "node": "set_outlook_properties",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "set_outlook_properties": {
+      "main": [
+        [
+          {
+            "node": "prepare_db_params",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "update_action_decisions": {
+      "main": [
+        [
+          {
+            "node": "log_to_sync_log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prepare_db_params": {
+      "main": [
+        [
+          {
+            "node": "update_action_decisions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "log_to_sync_log": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Start": [
+      {
+        "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARu8txsAAA=",
+        "attention_tier": "A",
+        "tier_reason": "VIP finance source with investment recommendation",
+        "topic_primary": "investment",
+        "topic_secondary": "stock_analysis",
+        "source_tier": "vip_finance",
+        "source_name": "Inderes",
+        "time_urgency": "today",
+        "outlook_categories": [
+          "Investment",
+          "VIP Finance"
+        ],
+        "outlook_flag_status": "flagged",
+        "outlook_importance": "high",
+        "confidence_score": 92,
+        "ai_reasoning": "Critical investment signal from trusted analyst source",
+        "sync_status": "pending",
+        "created_at": "2025-10-10T12:00:00Z"
+      }
+    ]
+  },
+  "meta": {
+    "instanceId": "5bc588890427261aec904f1de6ea2c47f92f0021d7680fbf9bd2043a6f4924b2"
+  }
+}

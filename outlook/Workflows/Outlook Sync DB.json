@@ -1,0 +1,476 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -2496,
+        -1216
+      ],
+      "id": "900b3b6d-345e-4cbb-938f-52f5834aa6d0",
+      "name": "Every 5 minutes"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  e.message_id,\n  e.user_upn,\n  e.from_address,\n  e.from_domain,\n  e.subject,\n  ad.outlook_categories AS db_categories,\n  ad.outlook_flag_status AS db_flag,\n  ad.outlook_importance AS db_importance,\n  ad.synced_to_outlook_at,\n  ad.attention_tier\nFROM outlook.emails_ingest e\nJOIN outlook.action_decisions ad ON e.message_id = ad.message_id\nWHERE ad.sync_status IN ('synced', 'user_modified')\n  AND ad.synced_to_outlook_at < NOW() - INTERVAL '5 minutes'\n  AND e.is_deleted = FALSE\n  AND e.is_deleted = FALSE\n  AND ad.sync_status = 'synced'\nORDER BY ad.synced_to_outlook_at ASC\nLIMIT 50;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -2336,
+        -1216
+      ],
+      "id": "9d9119cb-a9a4-4bf7-9c3b-a612d6cd30ab",
+      "name": "fetch_synced_messages",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.message_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -2160,
+        -1216
+      ],
+      "id": "63aff55a-afd9-4b6e-a69c-1f7fcb511ead",
+      "name": "has_messages"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nif (!items || items.length === 0) {\n  return [];\n}\n\nconst requests = items.map((item, index) => ({\n  id: String(index),\n  method: 'GET',\n  url: `/users/${item.json.user_upn}/messages/${item.json.message_id}?$select=id,categories,importance,flag,isRead`\n}));\n\nreturn [{\n  json: {\n    requests: requests,\n    db_data: items.map(i => i.json)\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1968,
+        -1232
+      ],
+      "id": "fddb72aa-945b-47ae-ada9-cc934003b648",
+      "name": "build_batch_request"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.microsoft.com/v1.0/$batch",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ requests: $json.requests }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1792,
+        -1392
+      ],
+      "id": "3c5bbb78-1190-4ebe-8f4d-d9f34f838dc3",
+      "name": "fetch_outlook_state",
+      "notesInFlow": true,
+      "credentials": {
+        "oAuth2Api": {
+          "id": "wINgbOJ2X4ZzA7NV",
+          "name": "Graph Outlook"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Code node: detect_changes\n// KORJATTU: Käyttää merge-dataa\n\nconst items = $input.all();\n\nif (!items || items.length === 0) {\n  return [];\n}\n\n// Etsi outlook-data ja db-data\nlet outlookData = null;\nlet dbData = null;\n\nitems.forEach(item => {\n  if (item.json.responses) {\n    outlookData = item.json.responses;\n  }\n  if (item.json.db_data) {\n    dbData = item.json.db_data;\n  }\n});\n\nif (!outlookData || !dbData) {\n  console.log('Missing data:', { outlookData: !!outlookData, dbData: !!dbData });\n  return [];\n}\n\nconst changes = [];\n\noutlookData.forEach((response, index) => {\n  if (response.status !== 200) return;\n  \n  const outlook = response.body;\n  const db = dbData[index];\n  \n  if (!db || !outlook) return;\n  \n  // Vertaa kategorioita\n  const outlookCats = (outlook.categories || []).sort();\n  const dbCats = (db.db_categories || []).sort();\n  const categoryChanged = JSON.stringify(outlookCats) !== JSON.stringify(dbCats);\n  \n  // Vertaa flagia\n  const outlookFlag = outlook.flag?.flagStatus || 'notFlagged';\n  const dbFlag = db.db_flag || 'notFlagged';\n  const flagChanged = outlookFlag !== dbFlag;\n  \n  // Vertaa importancea\n  const outlookImp = outlook.importance || 'normal';\n  const dbImp = db.db_importance || 'normal';\n  const importanceChanged = outlookImp !== dbImp;\n  \n  if (categoryChanged || flagChanged || importanceChanged) {\n    changes.push({\n      message_id: db.message_id,\n      user_upn: db.user_upn,\n      from_address: db.from_address,\n      from_domain: db.from_domain,\n      subject: db.subject,\n      attention_tier: db.attention_tier,\n      changes: {\n        categories: categoryChanged ? {\n          old: dbCats,\n          new: outlookCats\n        } : null,\n        flag: flagChanged ? {\n          old: dbFlag,\n          new: outlookFlag\n        } : null,\n        importance: importanceChanged ? {\n          old: dbImp,\n          new: outlookImp\n        } : null\n      },\n      outlook_state: {\n        categories: outlookCats,\n        flag: outlookFlag,\n        importance: outlookImp\n      }\n    });\n  }\n});\n\nconsole.log(`Found ${changes.length} changes`);\nreturn changes.map(c => ({ json: c }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1488,
+        -1248
+      ],
+      "id": "f4dc120b-efe1-41cb-86d5-2a10af66e0f1",
+      "name": "detect_changes"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.message_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -1344,
+        -1248
+      ],
+      "id": "318476fe-5cbf-4ebd-9fe2-6860e948321f",
+      "name": "has_changes"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outlook.user_feedback (\n  message_id, feedback_type, ai_categories, user_categories,\n  from_address, from_domain, notes, created_at\n)\nVALUES (\n  $1, 'category_correction',\n  ARRAY(SELECT jsonb_array_elements_text($2::jsonb)),\n  ARRAY(SELECT jsonb_array_elements_text($3::jsonb)),\n  $4, $5, $6, NOW()\n)\nRETURNING \n  id,\n  $1 as message_id,\n  $4 as from_address,\n  $5 as from_domain,\n  $7 as attention_tier,\n  $2::jsonb as old_categories_json,\n  $3::jsonb as new_categories_json,\n  $8 as new_flag,\n  $9 as new_importance;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.message_id,\n  JSON.stringify($json.changes.categories?.old || []),\n  JSON.stringify($json.outlook_state.categories || []),\n  $json.from_address || 'unknown',\n  $json.from_domain || 'unknown',\n  'Categories changed',\n  $json.attention_tier || 'B',\n  $json.outlook_state.flag || 'notFlagged',\n  $json.outlook_state.importance || 'normal'\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -1152,
+        -1264
+      ],
+      "id": "7f426f1e-a586-4513-8225-d773ccda0257",
+      "name": "save_user_feedback",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH correction_count AS (\n  SELECT COUNT(*) as corrections\n  FROM outlook.user_feedback\n  WHERE from_domain = $2\n    AND created_at > NOW() - INTERVAL '30 days'\n)\nUPDATE outlook.sender_classification sc\nSET \n  user_corrections = user_corrections + 1,\n  confidence_score = CASE \n    WHEN (SELECT corrections FROM correction_count) >= 5 \n    THEN GREATEST(confidence_score - 5, 30)\n    ELSE confidence_score\n  END,\n  updated_at = NOW()\nWHERE (\n  sc.sender_key = $1\n  OR (sc.sender_key = $2 AND sc.sender_address IS NULL)\n)\nRETURNING sender_key, confidence_score, user_corrections;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.from_address,\n  $json.from_domain\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -1072,
+        -1056
+      ],
+      "id": "08af9165-3a4d-4459-98c8-e036b022dc9a",
+      "name": "update_sender_learning",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outlook.sync_log (\n  message_id, sync_direction, sync_type, sync_status,\n  outlook_state, db_state, changes_made, synced_at, created_at\n)\nVALUES (\n  $1, 'outlook_to_db', 'user_correction', 'synced',\n  $2::jsonb, $3::jsonb, $4::jsonb, NOW(), NOW()\n)\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [\n  $('prepare_update_data').item.json.message_id,\n  JSON.stringify($('prepare_update_data').item.json.outlook_state),\n  JSON.stringify({\n    attention_tier: $('prepare_update_data').item.json.attention_tier,\n    old_categories: JSON.parse($('prepare_update_data').item.json.old_categories_json)\n  }),\n  JSON.stringify({\n    categories: {\n      old: JSON.parse($('prepare_update_data').item.json.old_categories_json),\n      new: JSON.parse($('prepare_update_data').item.json.new_categories_json)\n    },\n    flag: { new: $('prepare_update_data').item.json.new_flag },\n    importance: { new: $('prepare_update_data').item.json.new_importance }\n  })\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -880,
+        -1056
+      ],
+      "id": "0fb46520-3c1e-41bc-a737-47dd316b1822",
+      "name": "log_sync",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -1456,
+        -1008
+      ],
+      "id": "764c1fc2-719e-4b7e-8508-3deb005e37c1",
+      "name": "no_changes"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -2160,
+        -976
+      ],
+      "id": "b9d41355-71b5-4f1d-b271-acea9c195bd9",
+      "name": "no_messages"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.action_decisions\nSET \n  outlook_categories = CASE \n    WHEN $2::jsonb IS NOT NULL \n    THEN ARRAY(SELECT jsonb_array_elements_text($2::jsonb))\n    ELSE outlook_categories \n  END,\n  outlook_flag_status = COALESCE($3, outlook_flag_status),\n  outlook_importance = COALESCE($4, outlook_importance),\n  sync_status = 'synced',  -- ← MUUTETTU: Palauta 'synced'\n  outlook_state_snapshot = $5::jsonb,\n  updated_at = NOW()\nWHERE message_id = $1\nRETURNING message_id;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.message_id,\n  $json.new_categories_json,\n  $json.new_flag,\n  $json.new_importance,\n  JSON.stringify($json.outlook_state)\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -784,
+        -1264
+      ],
+      "id": "196b5a26-4cc9-44ea-9907-c9feff24d45e",
+      "name": "update_action_decisions",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -1648,
+        -1248
+      ],
+      "id": "d273e5a2-026c-43e2-b759-038ba7df068e",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Code node: prepare_update_data\n// Rakentaa datan oikeassa muodossa\n\nconst item = $input.first().json;\n\nreturn [{\n  json: {\n    message_id: item.message_id,\n    from_address: item.from_address,\n    from_domain: item.from_domain,\n    attention_tier: item.attention_tier,\n    \n    // Muunna arrayt JSON-stringeiksi\n    old_categories_json: JSON.stringify(item.old_categories_json || []),\n    new_categories_json: JSON.stringify(item.new_categories_json || []),\n    \n    new_flag: item.new_flag,\n    new_importance: item.new_importance,\n    \n    // Rakennettu outlook_state\n    outlook_state: {\n      categories: item.new_categories_json || [],\n      flag: item.new_flag,\n      importance: item.new_importance\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -976,
+        -1264
+      ],
+      "id": "21386ee5-44db-4828-85a8-1af7e89fae15",
+      "name": "prepare_update_data"
+    }
+  ],
+  "connections": {
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "fetch_synced_messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "fetch_synced_messages": {
+      "main": [
+        [
+          {
+            "node": "has_messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "has_messages": {
+      "main": [
+        [
+          {
+            "node": "build_batch_request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "no_messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "build_batch_request": {
+      "main": [
+        [
+          {
+            "node": "fetch_outlook_state",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "fetch_outlook_state": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "detect_changes": {
+      "main": [
+        [
+          {
+            "node": "has_changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "has_changes": {
+      "main": [
+        [
+          {
+            "node": "save_user_feedback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "no_changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "save_user_feedback": {
+      "main": [
+        [
+          {
+            "node": "prepare_update_data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "update_sender_learning": {
+      "main": [
+        [
+          {
+            "node": "log_sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "update_action_decisions": {
+      "main": [
+        [
+          {
+            "node": "update_sender_learning",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "detect_changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prepare_update_data": {
+      "main": [
+        [
+          {
+            "node": "update_action_decisions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "5bc588890427261aec904f1de6ea2c47f92f0021d7680fbf9bd2043a6f4924b2"
+  }
+}

@@ -1,0 +1,566 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -1568,
+        -784
+      ],
+      "id": "489f3ffe-5383-4420-afc4-788163eaf080",
+      "name": "Start"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pura body/uniqueBody jokaiselle itemille 1:1 samalla indeksillä\nreturn items.map((it, i) => {\n  const r = it.json || {};\n  const d  = r.graph_body || r || {};\n  const b  = d.body || {};\n  const ub = d.uniqueBody || {};\n\n  const raw =\n    typeof b.content === 'string' ? b.content\n  : typeof ub.content === 'string' ? ub.content\n  : (b.content ?? ub.content ?? null);\n\n  // Pakota merkkijonoksi: string | array | object -> string\n  let content = null;\n  if (typeof raw === 'string') {\n    content = raw;\n  } else if (Array.isArray(raw)) {\n    content = raw.map(x => (typeof x === 'string' ? x : JSON.stringify(x))).join('\\n');\n  } else if (raw != null) {\n    content = JSON.stringify(raw);\n  }\n\n  const content_type = b.contentType || ub.contentType || null;\n  const ref = $item(0).$node[\"Loop Over Items\"].json;\n\n\n  return {\n    json: {\n      user_upn: ref.user_upn,\n      message_id: ref.message_id,\n      content,\n      content_type,\n      has_content: typeof content === 'string' && content.length > 0\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        -800
+      ],
+      "id": "e43219e1-5ee5-498d-8d74-409fc951d528",
+      "name": "parse_graph_body"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b2852cbb-af88-4d51-ab55-ca7eb7487999",
+              "leftValue": "={{ $json.has_content }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -272,
+        -800
+      ],
+      "id": "6f93b1f8-9dcf-4002-ad5b-7612cd73dc47",
+      "name": "has_content"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outlook.email_bodies\n  (message_id, content, content_type, size_bytes, created_at)\nVALUES\n  ($1, $2, $3, GREATEST(octet_length($2),0), NOW())\nON CONFLICT (message_id) DO UPDATE SET\n  content      = EXCLUDED.content,\n  content_type = EXCLUDED.content_type,\n  size_bytes   = EXCLUDED.size_bytes\nRETURNING message_id;         -- ← lisää tämä",
+        "options": {
+          "queryReplacement": "={{ [ $json.message_id, $json.content, $json.content_type ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -96,
+        -912
+      ],
+      "id": "48310cb4-60a3-442b-97c3-32a567c313c7",
+      "name": "upsert_email_bodies",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.emails_ingest\nSET\n  needs_body = false,\n  body_fetched_at = NOW(),\n  last_body_fetch_status = 'ok',\n  retry_at = NULL\nWHERE message_id = $1;\n",
+        "options": {
+          "queryReplacement": "={{ $json.message_id }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        80,
+        -640
+      ],
+      "id": "d5c17e49-a6aa-4171-be6d-412e084c76a8",
+      "name": "mark_fetched_ok",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.emails_ingest\nSET\n  last_body_fetch_status = 'empty',\n  retry_at = NOW() + INTERVAL '2 hours'\nWHERE message_id = $1;\n",
+        "options": {
+          "queryReplacement": "={{ $json.message_id }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -96,
+        -736
+      ],
+      "id": "28f1c9c4-d008-4514-be9c-9a9ca74e5a39",
+      "name": "mark_empty_retry",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.microsoft.com/v1.0/users/{{ $json.user_upn }}/messages/{{ encodeURIComponent($json.message_id) }}?$select=body,uniqueBody,bodyPreview",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "outlook.body-content-type=\"text\""
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -976,
+        -784
+      ],
+      "id": "166132fa-fcd6-47a5-a5e3-94e5c547422e",
+      "name": "graph_get_body",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "credentials": {
+        "oAuth2Api": {
+          "id": "wINgbOJ2X4ZzA7NV",
+          "name": "Graph Outlook"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Mapataan kaikki HTTP-vastaukset 1:1 ja liitetään oikea user_upn/message_id indeksin mukaan\nreturn items.map((it, i) => {\n  const j = it.json || {};\n  const status = Number(j.statusCode ?? j.status ?? 200);\n  const body = j.body ?? j; // fullResponse=true → body on j.body\n\n  const okHeuristic = !!(body && (body.id || body.body || body.uniqueBody));\n  const is_ok = (status >= 200 && status < 300) || (status === 0 && okHeuristic);\n  const is_retryable = status === 429 || status >= 500;\n\n  let retryAfterSec = null;\n  const hdrs = j.headers || {};\n  const ra = Object.entries(hdrs).find(([k]) => k.toLowerCase() === 'retry-after')?.[1];\n  if (ra) {\n    const n = parseInt(ra, 10);\n    retryAfterSec = Number.isFinite(n) ? Math.max(n,1) : Math.max(Math.ceil((Date.parse(ra)-Date.now())/1000),1);\n  }\n\n  // Ota user_upn + message_id samalta indeksiltä pluck_fields-solmusta\n   const ref = $item(0).$node[\"Loop Over Items\"].json;\n\n  return {\n    json: {\n      status_code: Number.isFinite(status) ? status : 0,\n      is_ok,\n      is_retryable,\n      status_label: is_ok ? 'ok' : (is_retryable ? `retryable:${status}` : `fatal:${status}`),\n      retry_after_seconds: retryAfterSec,\n      user_upn: ref.user_upn,\n      message_id: ref.message_id,\n      graph_body: body\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -816,
+        -784
+      ],
+      "id": "4f3a0634-27eb-44ae-a86a-6b8097c88b4b",
+      "name": "classify_status"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b2852cbb-af88-4d51-ab55-ca7eb7487999",
+              "leftValue": "={{ $json.is_ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -656,
+        -784
+      ],
+      "id": "46843b13-e464-4f79-bd1f-4481f56b0811",
+      "name": "is_ok"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b2852cbb-af88-4d51-ab55-ca7eb7487999",
+              "leftValue": "={{ $json.is_retryable }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -608,
+        -608
+      ],
+      "id": "9716894c-a341-470b-90c0-c082efdf8179",
+      "name": "is_retryable"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.emails_ingest\nSET\n  last_body_fetch_status = $2,\n  retry_at = NOW() + (COALESCE($3,120)::int || ' seconds')::interval\nWHERE message_id = $1;\n",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.message_id,\n  $json.status_label,\n  $json.retry_after_seconds\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -352,
+        -624
+      ],
+      "id": "1d2ef2d8-982e-480e-9327-3a0d85d700a1",
+      "name": "mark_retry_backoff",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.emails_ingest\nSET\n  last_body_fetch_status = $2,\n  retry_at = NULL\nWHERE message_id = $1;\n",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.message_id,\n  $json.status_label\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -352,
+        -448
+      ],
+      "id": "2012de0e-96e7-49dc-bcf2-8e282c2bba83",
+      "name": "mark_fatal",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -1216,
+        -784
+      ],
+      "id": "50a1b905-76ac-4bda-94f4-fea262f30eb9",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "jsCode": "// flatten_batch_items — n8n Code (JavaScript)\n// Muuttaa batch-rakenteen flattened array:ksi\n// Input: [{ user_upn, batch_items: [...] }]\n// Output: [{ user_upn, message_id, ... }, { user_upn, message_id, ... }, ...]\n\nconst results = [];\n\nfor (const item of items) {\n  const input = item.json;\n  \n  // Tarkista että on batch_items\n  if (!input.batch_items || !Array.isArray(input.batch_items)) {\n    // Jos ei ole batch_items, ohita tai palauta virhe\n    continue;\n  }\n  \n  const userUpn = input.user_upn;\n  \n  // Käy läpi jokainen batch_item ja lisää user_upn\n  for (const batchItem of input.batch_items) {\n    results.push({\n      json: {\n        user_upn: userUpn,\n        message_id: batchItem.message_id,\n        internet_message_id: batchItem.internet_message_id,\n        folder_id: batchItem.folder_id,\n        subject: batchItem.subject,\n        from_domain: batchItem.from_domain,\n        from_address: batchItem.from_address,\n        body_preview: batchItem.body_preview,\n        body_content: batchItem.body_content,\n        has_body: batchItem.has_body,\n        body_content_type: batchItem.body_content_type,\n        body_size_bytes: batchItem.body_size_bytes,\n        received_datetime: batchItem.received_datetime,\n        needs_body: batchItem.needs_body,\n        analyzed_at: batchItem.analyzed_at\n      }\n    });\n  }\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1408,
+        -784
+      ],
+      "id": "da0ce550-51a8-40e9-9a4c-b76f1eece253",
+      "name": "latten_batch_items"
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "latten_batch_items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "parse_graph_body": {
+      "main": [
+        [
+          {
+            "node": "has_content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "has_content": {
+      "main": [
+        [
+          {
+            "node": "upsert_email_bodies",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "mark_empty_retry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "upsert_email_bodies": {
+      "main": [
+        [
+          {
+            "node": "mark_fetched_ok",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "mark_fetched_ok": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "graph_get_body": {
+      "main": [
+        [
+          {
+            "node": "classify_status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "classify_status": {
+      "main": [
+        [
+          {
+            "node": "is_ok",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "is_ok": {
+      "main": [
+        [
+          {
+            "node": "parse_graph_body",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "is_retryable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "is_retryable": {
+      "main": [
+        [
+          {
+            "node": "mark_retry_backoff",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "mark_fatal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "graph_get_body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "latten_batch_items": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {
+    "Start": [
+      {
+        "user_upn": "jouni.pappila@repoxcapital.fi",
+        "message_ids": [
+          "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARyOnL3AAA=",
+          "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARyOnL2AAA=",
+          "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARyOnL1AAA=",
+          "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARyOnL0AAA="
+        ],
+        "batch_items": [
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARyOnL3AAA=",
+            "internet_message_id": "<00000068eb1dab-4-1e9b-qi4rye-6141546-155013066@uutiskirje.kauppalehti.fi>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAAAAAEMAAA=",
+            "subject": "Laadukkaimmat osinko-osakkeet Tukholman pörssissä / Hurja laskelma: Eläkeiän nosto 70 vuoteen poistaisi valtion YEL-menot",
+            "from_domain": "kauppalehti.fi",
+            "from_address": "tilaajienuutiskirje@kauppalehti.fi",
+            "body_preview": "Hyvää huomenta, arvoisa Kauppalehden tilaaja!\r\n\r\n\r\n        Avaa viesti selaimeen\r\n\r\n\r\n\r\n\r\n\r\n\r\nUutiset | Pörssi | Oma KL\r\n\r\n\r\n\r\n\r\n\r\nHyvää huomenta, arvoisa tilaaja!\r\n\r\nNuoren yrittäjän oivallus synnytti 522 prosentin kasvun.\r\n\r\nAnna Juvonen\r\nUutispäällikkö",
+            "body_content": null,
+            "has_body": false,
+            "body_content_type": null,
+            "body_size_bytes": 0,
+            "received_datetime": "2025-10-12T03:17:21.000Z",
+            "needs_body": true,
+            "analyzed_at": null
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARyOnL2AAA=",
+            "internet_message_id": "<ccb04d48-2b51-44d8-808e-393ed85bd9d3@az.westus.microsoft.com>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAAAAAEMAAA=",
+            "subject": "Microsoft-laskusi G118602826 on valmis",
+            "from_domain": "microsoft.com",
+            "from_address": "microsoft-noreply@microsoft.com",
+            "body_preview": "Voit tarkastaa viimeisimmän laskusi kirjautumalla sisään.\r\n\r\nTarkista Microsoft-laskusi\r\n\r\nLaskutusyhteenveto on valmiina tarkastettavaksi (ks. liite). Kirjaudu sisään, jos haluat tarkastella sitä. Jos olet jo maksanut, voit jättää tämän sähköpostiviestin",
+            "body_content": null,
+            "has_body": false,
+            "body_content_type": null,
+            "body_size_bytes": 0,
+            "received_datetime": "2025-10-12T02:58:21.000Z",
+            "needs_body": true,
+            "analyzed_at": null
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARyOnL1AAA=",
+            "internet_message_id": "<BplOHshh-lVLtE_Cry_4HUYsnlmmvZENZlqN-e9yMVqv67ecgb5LDN_rK8XfvZZhn9LVqY8dOuCMOyhBznBl4zXBn-PL0I1rW1wN9G6JURLokBpC6yXCBPKaYiY_TyfIOYbp4wtDbwwcvBnZmNoAAQIA@t2.msgid.quoramail.com>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAAAAAEMAAA=",
+            "subject": "How safe is Finland?",
+            "from_domain": "quora.com",
+            "from_address": "english-personalized-digest@quora.com",
+            "body_preview": "Et saa usein sähköpostia osoitteesta english-personalized-digest@quora.com. Lue, miksi tämä on tärkeää\r\nI lived in Helsinki for 7 years, kontula district for 4 years. It is supposed to be a troubled neighborhood ,but for me : -I never saw a fist fight -wo",
+            "body_content": null,
+            "has_body": false,
+            "body_content_type": null,
+            "body_size_bytes": 0,
+            "received_datetime": "2025-10-12T00:09:49.000Z",
+            "needs_body": true,
+            "analyzed_at": null
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARyOnL0AAA=",
+            "internet_message_id": "<20251011160039.41961244.1416963@sailthru.com>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAAAAAEMAAA=",
+            "subject": "AMD: OpenAI Got A Bargain - I Wouldn't Hold Into Earnings",
+            "from_domain": "seekingalpha.com",
+            "from_address": "account@seekingalpha.com",
+            "body_preview": "Advanced Micro Devices is now up+40% over the past five days on news of a partnership with OpenAI for a potential 10% st\r\n\r\nMust Reads\r\n\r\n \r\n \r\n\r\nRead every Must Reads article with Premium. Try 1 month for only $4.95 »\r\n\r\n \r\n \r\n \r\n \r\n \r\n\r\nFREE TRENDING AR",
+            "body_content": null,
+            "has_body": false,
+            "body_content_type": null,
+            "body_size_bytes": 0,
+            "received_datetime": "2025-10-11T20:02:29.000Z",
+            "needs_body": true,
+            "analyzed_at": null
+          }
+        ],
+        "count": 4
+      }
+    ]
+  },
+  "meta": {
+    "instanceId": "5bc588890427261aec904f1de6ea2c47f92f0021d7680fbf9bd2043a6f4924b2"
+  }
+}

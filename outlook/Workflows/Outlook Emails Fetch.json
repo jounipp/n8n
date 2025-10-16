@@ -1,0 +1,1174 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// Output: { url, is_resume, user_upn, resource_path, folder_id }\n\nvar env = ($node['set_config'] && $node['set_config'].json) ? $node['set_config'].json : {};\nvar upn = env.USER_UPN || $json.user_upn || $json.USER_UPN || null;\n\nvar resume = $json.resume_link || $json.next_link || $json.delta_link || null;\nvar pathIn = $json.resource_path || $json.path || '/messages/delta';\n\nvar top = (isFinite(Number(env.GRAPH_TOP)) ? Number(env.GRAPH_TOP) : 100);\nvar select = (typeof env.GRAPH_SELECT === 'string') ? env.GRAPH_SELECT : 'id,receivedDateTime,subject,from,toRecipients,ccRecipients,hasAttachments,conversationId,bodyPreview';\nvar expand = (typeof env.GRAPH_EXPAND === 'string') ? env.GRAPH_EXPAND : ''; // LISÄTTY\n\nfunction normalizePath(p) {\n  if (!p) return '/messages/delta';\n  \n  // Poista users/<upn>/ alusta jos on\n  var cleaned = p.replace(/^users\\/[^\\/]+\\//, '/');\n  \n  // Varmista että alkaa /\n  if (!cleaned.startsWith('/')) {\n    cleaned = '/' + cleaned;\n  }\n  \n  // Jos päättyy /messages, lisää /delta\n  if (cleaned.endsWith('/messages')) {\n    cleaned = cleaned + '/delta';\n  }\n  \n  return cleaned;\n}\n\nfunction buildQuery(params) {\n  var parts = [];\n  for (var k in params) {\n    if (!params.hasOwnProperty(k)) continue;\n    var v = params[k];\n    if (v === undefined || v === null || v === '') continue;\n    parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(v)));\n  }\n  return parts.length ? '?' + parts.join('&') : '';\n}\n\nfunction extractFolderId(p) {\n  var m = /mailFolders\\('([^']+)'\\)/.exec(p || '');\n  return m ? m[1] : null;\n}\n\nif (!upn) { \n  throw new Error('prepare_delta_url: USER_UPN puuttuu'); \n}\n\n// Poista users/<upn>/ alusta URL:ää varten, mutta säilytä se resource_path:ssa\nvar pathForUrl = pathIn;\nif (pathForUrl.startsWith('users/')) {\n  // Poista users/<upn>/ alusta\n  pathForUrl = pathForUrl.replace(/^users\\/[^\\/]+/, '');\n}\n\n// Korjaa mailFolders('ID') → mailFolders/ID Graph API:ta varten\npathForUrl = pathForUrl.replace(/mailFolders\\('([^']+)'\\)/, 'mailFolders/$1');\n\n// Säilytä alkuperäinen resource_path tallennusta varten\nvar pathNorm = pathIn;\n\nvar url;\nvar isResume = false;\n\nif (resume) {\n  // Jatka mistä jäätiin\n  url = resume;\n  isResume = true;\n} else {\n  // Rakenna uusi URL\n  var base = 'https://graph.microsoft.com/v1.0/users/' + upn;\n  var qp = buildQuery({\n    '$top': top,\n    '$select': (select && select.trim().length > 0) ? select : undefined,\n    '$expand': (expand && expand.trim().length > 0) ? expand : undefined  // LISÄTTY\n  });\n  url = base + pathForUrl + qp;\n}\n\n// Palauta tiedot\nreturn [{\n  json: {\n    url: url,\n    is_resume: isResume,\n    user_upn: upn,\n    resource_path: pathNorm,  // Normalisoitu muoto: /mailFolders('ID')/messages/delta\n    folder_id: $json.folder_id || extractFolderId(pathNorm)\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1552,
+        -352
+      ],
+      "id": "4a7e1e5b-3883-4c55-b30a-60097c6ed9fb",
+      "name": "prepare_delta_url"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1216,
+        -352
+      ],
+      "id": "ca2d7503-4f1d-434a-8650-78134f34ddb6",
+      "name": "fetch_emails_http",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "credentials": {
+        "oAuth2Api": {
+          "id": "wINgbOJ2X4ZzA7NV",
+          "name": "Graph Outlook"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH inp AS (\n  SELECT \n    $1::text  AS user_upn,\n    $2::text  AS resource_path,\n    NULLIF($3::text, '') AS delta_link,\n    COALESCE($4::int, 0) AS items_processed\n)\nINSERT INTO outlook.delta_state (\n  user_upn, resource_path, resource_type, delta_link, next_link,\n  last_sync_success, sync_status, items_processed, updated_at\n)\nSELECT \n  i.user_upn, i.resource_path, 'messages', i.delta_link, NULL,\n  NOW(), 'completed', i.items_processed, NOW()\nFROM inp i\nWHERE i.delta_link IS NOT NULL\nON CONFLICT (user_upn, resource_path) DO UPDATE SET\n  delta_link        = EXCLUDED.delta_link,\n  next_link         = NULL,\n  last_sync_success = NOW(),\n  sync_status       = 'completed',\n  items_processed   = EXCLUDED.items_processed,\n  updated_at        = NOW()\nRETURNING *;\n",
+        "options": {
+          "queryReplacement": "={{ [ \n  ($json.user_upn || $node['set_config'].json.USER_UPN),\n  $json.resource_path,\n  ($json.deltaLink || $json['@odata.deltaLink'] || null),\n  ($json.items_processed_in_run || $json.items_processed || 0)\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        160,
+        -560
+      ],
+      "id": "75cf08a3-fa4e-4100-9c61-a2e1f47b25bc",
+      "name": "save_delta_link",
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "USER_UPN",
+              "value": "jouni.pappila@repoxcapital.fi"
+            },
+            {
+              "name": "GRAPH_SELECT",
+              "value": "id,parentFolderId,receivedDateTime,subject,from,toRecipients,ccRecipients,bccRecipients,hasAttachments,conversationId,internetMessageId,bodyPreview,isRead,isDraft,inferenceClassification,categories,importance,replyTo,sender,flag,webLink,internetMessageHeaders"
+            },
+            {
+              "name": "GRAPH_EXPAND",
+              "value": "attachments($select=id,name,contentType,size,isInline)"
+            }
+          ],
+          "number": [
+            {
+              "name": "GRAPH_TOP",
+              "value": 10000
+            },
+            {
+              "name": "PAGES_PER_RUN",
+              "value": 7
+            },
+            {
+              "name": "MAX_ITEMS_PER_RUN",
+              "value": 70
+            }
+          ]
+        },
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        -1552,
+        -688
+      ],
+      "id": "01378d9c-ad0d-4386-b2fd-6e60cbc85faf",
+      "name": "set_config"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.nextLink || $json.next_link || $json['@odata.nextLink'] || ($json.metadata && $json.metadata.nextLink) }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -768,
+        -160
+      ],
+      "id": "803ceb77-338b-4fe1-a4ce-207f03d869c4",
+      "name": "fetch_next_page",
+      "executeOnce": false,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "credentials": {
+        "oAuth2Api": {
+          "id": "wINgbOJ2X4ZzA7NV",
+          "name": "Graph Outlook"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// state_for_paging — välitä nextLink/deltaLink + laskurit sellaisenaan\nreturn items.map(item => {\n  const j = item.json ?? {};\n\n  const nextLink =\n    j.nextLink ??\n    j.next_link ??\n    j['@odata.nextLink'] ??\n    (j.metadata && j.metadata.nextLink) ??\n    '';\n\n  const deltaLink =\n    j.deltaLink ??\n    j.delta_link ??\n    j['@odata.deltaLink'] ??\n    (j.metadata && j.metadata.deltaLink) ??\n    '';\n\n  return {\n    json: {\n      nextLink,\n      deltaLink,\n      items_processed_in_run: Number(j.items_processed_in_run || 0),\n      pages_in_run: Number(j.pages_in_run || 0),\n      run_limit: Number(j.run_limit || 1000),\n\n      // reitityksessä tarvittavat tunnisteet talteen\n      resource_path: j.resource_path ?? null,\n      user_upn: j.user_upn ?? null,\n      folder_id: j.folder_id ?? null,\n      folder_name: j.folder_name ?? null\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -512,
+        -160
+      ],
+      "id": "19ab3b83-0997-4027-b24b-96cd1a2b02bb",
+      "name": "state_for_paging"
+    },
+    {
+      "parameters": {
+        "jsCode": "// map_ingest_min — kevyt ingest ilman bodya\n\nfunction addr(o) { return o?.emailAddress?.address || null; }\nfunction nameOf(o) { return o?.emailAddress?.name || null; }\nfunction dom(s) { if (!s) return null; const i = s.indexOf('@'); return i > 0 ? s.slice(i+1).toLowerCase() : null; }\n\nconst context = $json;                       // säilytä folder_name/path ym. konteksti\nconst v = Array.isArray($json.value) ? $json.value : [];\n\nconst out = v.map(m => {\n  const to  = Array.isArray(m.toRecipients)  ? m.toRecipients .map(r => addr(r)).filter(Boolean) : [];\n  const cc  = Array.isArray(m.ccRecipients)  ? m.ccRecipients .map(r => addr(r)).filter(Boolean) : [];\n  const bcc = Array.isArray(m.bccRecipients) ? m.bccRecipients.map(r => addr(r)).filter(Boolean) : [];\n\n  const fromA   = addr(m.from);\n  const replyTo = addr(m.replyTo);\n  const senderA = addr(m.sender);\n\n  // Dedupe: internetMessageId ensisijainen, muuten id|received\n  const dedupeKey = m.internetMessageId || ((m.id || '') + '|' + (m.receivedDateTime || ''));\n\n  return {\n    // IMMUTABLE\n    message_id: m.id || null,\n    internet_message_id: m.internetMessageId || null,\n    conversation_id: m.conversationId || null,\n    received_datetime: m.receivedDateTime || null,\n    sent_datetime: m.sentDateTime || null,\n    created_datetime: m.createdDateTime || null,\n\n    subject: m.subject || null,\n    body_preview: m.bodyPreview || null,\n\n    from_address: fromA,\n    from_name: nameOf(m.from),\n    from_domain: dom(fromA),\n    reply_to_address: replyTo,\n    sender_address: senderA,\n\n    to_recipients: to,\n    cc_recipients: cc,\n    bcc_recipients: bcc,\n    to_count: to.length,\n    cc_count: cc.length,\n    bcc_count: bcc.length,\n\n    has_attachments: !!m.hasAttachments,\n    web_link: m.web_link || null,\n\n    // HEADER-ydin (tuotu parse_headers-solmusta)\n    unsubscribe_link: m.unsubscribe_link || null,\n    list_id: m.list_id || null,\n    precedence: m.precedence || null,\n    auto_submitted: m.auto_submitted || null,\n    message_id_header: m.message_id_header || null,\n    email_references: m.email_references || null,\n    in_reply_to: m.in_reply_to || null,\n\n    dedupe_key: dedupeKey,\n\n    // MUTABLE\n    last_modified_datetime: m.lastModifiedDateTime || null,\n    parent_folder_id: m.parentFolderId || null,\n    folder_name: context.folder_name || null,\n    folder_path: context.folder_path || null,\n\n    is_read: !!m.isRead,\n    is_draft: !!m.isDraft,\n    flag_status: m.flag?.flagStatus || null,\n    importance: m.importance || null,\n    sensitivity: m.sensitivity || null,\n    inference_classification: m.inferenceClassification || null,\n    categories: Array.isArray(m.categories) ? m.categories : [],\n\n    features: {},\n    processing_status: 'raw',\n\n    // EI BODYA TÄSSÄ VAIHEESSA\n    // email_body: (poistettu)\n\n    // Säilytä header- ja liiteobjektit jatko-upsertia varten\n    email_headers: m.email_headers || null,\n    attachments_metadata: m.attachments_metadata || [],\n    attachment_review_items: m.attachment_review_items || []\n  };\n});\n\n// Palauta vanhalla muodolla: upsert_emails lukee $json.emails\n$json.emails = out;\nreturn [{ json: $json }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        -672
+      ],
+      "id": "a829aa8e-bad7-4530-9af5-ad0602f9a8c8",
+      "name": "map_ingest_min"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH inp AS (\n  SELECT\n    $1::text  AS user_upn,\n    $2::text  AS resource_path,\n    NULLIF($3::text,'') AS next_link,\n    COALESCE($4::int,0) AS items_processed\n),\nupd AS (\n  UPDATE outlook.delta_state ds\n  SET\n    next_link       = COALESCE(i.next_link, ds.next_link),\n    items_processed = i.items_processed,\n    sync_status     = 'in_progress',\n    updated_at      = NOW()\n  FROM inp i\n  WHERE ds.user_upn = i.user_upn\n    AND ds.resource_path = i.resource_path\n  RETURNING ds.user_upn, ds.resource_path, ds.next_link, ds.items_processed\n),\nins AS (\n  INSERT INTO outlook.delta_state (\n    user_upn, resource_path, resource_type, delta_link, next_link,\n    last_sync_success, sync_status, items_processed, updated_at\n  )\n  SELECT\n    i.user_upn, i.resource_path, 'messages', NULL, i.next_link,\n    NULL, 'in_progress', i.items_processed, NOW()\n  FROM inp i\n  WHERE NOT EXISTS (SELECT 1 FROM upd)\n  ON CONFLICT (user_upn, resource_path) DO UPDATE SET\n    next_link       = EXCLUDED.next_link,\n    sync_status     = 'in_progress',\n    items_processed = EXCLUDED.items_processed,\n    updated_at      = NOW()\n  RETURNING user_upn, resource_path, next_link, items_processed\n)\nSELECT * FROM upd\nUNION ALL\nSELECT * FROM ins;\n",
+        "options": {
+          "queryReplacement": "={{ [\n  ($json.user_upn || $node['set_config'].json.USER_UPN),\n  $json.resource_path,\n  ($json.nextLink || $json.next_link || $json['@odata.nextLink'] || ($json.metadata && $json.metadata.nextLink) || NULL),\n  ($json.items_processed_in_run || $json.items_processed || 0)\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        400,
+        -160
+      ],
+      "id": "20c27baf-61c6-485d-9561-c9236a3ccf95",
+      "name": "save_progres",
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "246392e0-35f1-4e15-ba7f-f166154a00f6",
+              "leftValue": "={{ $json.nextLink || $json.next_link || $json['@odata.nextLink'] || ($json.metadata && $json.metadata.nextLink) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        160,
+        -208
+      ],
+      "id": "70f74df5-e77e-4af7-b43e-b99eede94782",
+      "name": "has_next_link"
+    },
+    {
+      "parameters": {
+        "jsCode": "// calc_run_limit — ainoa paikka jossa laskureita kasvatetaan\nreturn items.map(item => {\n  const j = item.json ?? {};\n\n  // Tämän sivun rivimäärä\n  const pageCount = Number.isFinite(Number(j.this_page_count))\n    ? Number(j.this_page_count)\n    : (Array.isArray(j.value) ? j.value.length : 0);\n\n  // Kasvata laskureita kerran\n  j.items_processed_in_run = Number(j.items_processed_in_run || 0) + pageCount;\n  j.pages_in_run           = Number(j.pages_in_run || 0) + 1;\n\n  // Helpompi debug\n  j.this_page_count = pageCount;\n\n  return { json: j };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -432,
+        -352
+      ],
+      "id": "48f650b8-5a72-49a6-8d7a-3f27c0d34702",
+      "name": "calc_run_limit"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.delta_state\nSET\n  next_link = CASE WHEN $1 IS NULL OR $1 = '' THEN next_link ELSE $1 END,\n  items_processed = COALESCE($2::int, 0),\n  sync_status = 'in_progress',\n  updated_at = NOW()\nWHERE user_upn = $3\n  AND resource_path = $4\nRETURNING *;\n",
+        "options": {
+          "queryReplacement": "={{ [\n  ($json.nextLink || $json.next_link || $json['@odata.nextLink'] || null),\n  ($json.items_processed_in_run || $json.items_processed || 0),\n  ($json.user_upn || $node['set_config'].json.USER_UPN),\n  $json.resource_path\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        160,
+        -384
+      ],
+      "id": "1fcc3008-ff16-4ae9-85da-6d126185bdb1",
+      "name": "save_progress_only",
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b2f0a94a-eb67-447b-8132-61e1eb7a490a",
+              "leftValue": "={{ $json.deltaLink \n   || $json['@odata.deltaLink'] \n   || ($json.metadata && $json.metadata.deltaLink) \n   || '' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "9d52e0fb-9495-412a-86eb-53854663e2be",
+              "leftValue": "={{ $json.nextLink \n   || $json.next_link \n   || $json['@odata.nextLink'] \n   || ($json.metadata && $json.metadata.nextLink) \n   || '' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "empty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -112,
+        -560
+      ],
+      "id": "b3538a70-3c47-4e24-b118-687aa4f982d3",
+      "name": "can_save_delta"
+    },
+    {
+      "parameters": {
+        "jsCode": "// process_emails — laskee sivun koon, normalisoi linkit/metadatan.\n// EI nosta laskureita. calc_run_limit hoitaa inkrementit.\n// KANTAA SEKÄ items_processed_in_run ETTÄ pages_in_run STATESTA.\n\nconst RP_RE = /^users\\/[^/]+\\/mailFolders\\('[^']+'\\)\\/messages\\/delta$/;\n\n// Hae toisen solmun outputtia samalla $itemIndexillä\nfunction getNodeJson(name) {\n  try {\n    const arr = $items(name);\n    if (Array.isArray(arr) && arr.length) {\n      const it = arr[$itemIndex] || arr[0];\n      return it && it.json ? it.json : null;\n    }\n  } catch {}\n  return null;\n}\n\n// Tuo kantoluvut state_for_pagingista\nfunction getState() {\n  try {\n    const arr = $items('state_for_paging');\n    if (Array.isArray(arr) && arr.length) {\n      const it = arr[$itemIndex] || arr[0];\n      return (it && it.json) ? it.json : {};\n    }\n  } catch {}\n  return {};\n}\n\nconst loadTarget = getNodeJson('load_targets') || getNodeJson('load_targets_saapuneet');\nconst prepDelta  = getNodeJson('prepare_delta_url');\nconst prevSave   = getNodeJson('save_progres');\nconst prevState  = getState();\n\nconst SET = $node['set_config']?.json || {};\n\n// user_upn prioriteetti\nconst UPN = SET.user_upn ?? ($json && $json.user_upn) ?? prepDelta?.user_upn ?? loadTarget?.user_upn ?? null;\n\nreturn items.map(item => {\n  const j = item.json || {};\n\n  // Linkit → metadata\n  const nextLink =\n    j['@odata.nextLink'] ??\n    (j.metadata && j.metadata.nextLink) ??\n    j.nextLink ?? null;\n\n  const deltaLink =\n    j['@odata.deltaLink'] ??\n    (j.metadata && j.metadata.deltaLink) ??\n    j.deltaLink ?? null;\n\n  // Sähköpostit\n  const arr = Array.isArray(j.value) ? j.value : [];\n  const thisPageCount = arr.length;\n\n  // CARRY: juoksevat laskurit edelliseltä sivulta\n  const carryItems =\n    Number(\n      (prevSave && prevSave.items_processed) ??\n      (prevState && (prevState.items_processed_in_run ?? prevState.items_processed)) ??\n      j.items_processed_in_run ??\n      0\n    ) || 0;\n\n  const carryPages =\n    Number(\n      (prevState && prevState.pages_in_run) ??\n      j.pages_in_run ??\n      0\n    ) || 0;\n\n  // resource_path vain sallitussa muodossa\n  let rp = j.resource_path ?? ($node['prepare_delta_url']?.json?.resource_path ?? null);\n  if (typeof rp === 'string' && !RP_RE.test(rp)) rp = null;\n\n  // Kirjoita ulos — EI INKREMENTTIÄ TÄSSÄ\n  j.metadata = j.metadata || {};\n  j.metadata.nextLink  = nextLink;\n  j.metadata.deltaLink = deltaLink;\n\n  j.items_processed        = thisPageCount;     // nykyisen sivun rivit\n  j.this_page_count        = thisPageCount;     // nykyisen sivun rivit\n  j.items_processed_in_run = carryItems;        // juokseva – kasvatetaan calc_run_limitissa\n  j.pages_in_run           = carryPages;        // juokseva – kasvatetaan calc_run_limitissa\n  j.run_limit              = Number(j.run_limit ?? prevState?.run_limit ?? 1000);\n\n  j.resource_path = rp;\n\n  // Injektoi user_upn jokaiseen viestiin\n  j.user_upn = UPN || j.user_upn || null;\n  j.value = arr.map(m => ({ ...m, user_upn: j.user_upn }));\n\n  // Folder-tiedot talteen\n  j.folder_id   = loadTarget?.folder_id   || prepDelta?.folder_id   || j.folder_id   || null;\n  j.folder_name = loadTarget?.folder_name || prepDelta?.folder_name || j.folder_name || null;\n\n  item.json = j;\n  return item;\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1056,
+        -352
+      ],
+      "id": "54392d57-be68-4eec-9607-6c15669f929b",
+      "name": "process_emails"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- TESTIVERSIO: Vain Saapuneet-kansio\nWITH base AS (\n  SELECT\n    ds.user_upn,\n    ds.resource_path AS original_path,\n    COALESCE(ds.next_link, ds.delta_link) AS resume_link,\n    ds.items_processed,\n    ds.sync_status,\n    ds.next_link,\n    ds.folder_id,     -- LISÄTTY\n    ds.folder_name    -- LISÄTTY\n  FROM outlook.delta_state ds\n  WHERE ds.user_upn = $1\n    -- TARKKA KANSIO: Saapuneet (Inbox)\n    AND ds.resource_path = 'users/jouni.pappila@repoxcapital.fi/mailFolders(''AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAAAAAEMAAA='')/messages/delta'\n)\nSELECT\n  user_upn,\n  original_path AS resource_path,\n  resume_link,\n  items_processed,\n  sync_status,\n  folder_id,      -- LISÄTTY\n  folder_name     -- LISÄTTY\nFROM base\nORDER BY\n  CASE\n    WHEN next_link IS NOT NULL        THEN 0  -- jatka sivutusta\n    WHEN sync_status = 'in_progress'  THEN 1\n    WHEN sync_status = 'idle'         THEN 2\n    ELSE 3                                  -- completed sallitaan viimeisenä\n  END,\n  items_processed ASC\nLIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ $node[\"set_config\"].json.USER_UPN }}\n\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -1552,
+        -528
+      ],
+      "id": "21f9a4f7-a566-45c3-b008-eb7764899770",
+      "name": "load_targets_saapuneet",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "function findHeader(headers, name) {\n  if (!Array.isArray(headers)) return null;\n  const header = headers.find(h => h.name.toLowerCase() === name.toLowerCase());\n  return header ? header.value : null;\n}\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const list = Array.isArray(item.json.value) ? item.json.value : [item.json];\n\n  // SÄILYTÄ KAIKKI OHJAUSKENTÄT\n  const context = {\n    '@odata.context': item.json['@odata.context'],\n    '@odata.deltaLink': item.json['@odata.deltaLink'],\n    '@odata.nextLink': item.json['@odata.nextLink'],\n    items_processed: item.json.items_processed,\n    items_processed_in_run: item.json.items_processed_in_run,\n    pages_in_run: item.json.pages_in_run,            // ← UUSI\n    this_page_count: item.json.this_page_count,      // ← UUSI\n    run_limit: item.json.run_limit,                  // ← UUSI\n    folder_name: item.json.folder_name,\n    folder_path: item.json.folder_path,\n    resource_path: item.json.resource_path,\n    user_upn: item.json.user_upn\n  };\n\n  const processedMessages = [];\n\n  for (const msg of list) {\n    const headers = msg.internetMessageHeaders || [];\n    const messageIdHeader = findHeader(headers, 'Message-ID');\n    const references      = findHeader(headers, 'References');\n    const inReplyTo       = findHeader(headers, 'In-Reply-To');\n    const listUnsubscribe = findHeader(headers, 'List-Unsubscribe');\n    const listId          = findHeader(headers, 'List-ID');\n    const receivedSpf     = findHeader(headers, 'Received-SPF');\n    const dkimSignature   = findHeader(headers, 'DKIM-Signature');\n    const returnPath      = findHeader(headers, 'Return-Path');\n    const authResults     = findHeader(headers, 'Authentication-Results');\n    const precedence      = findHeader(headers, 'Precedence');\n    const autoSubmitted   = findHeader(headers, 'Auto-Submitted');\n\n    processedMessages.push({\n      ...msg,\n      email_headers: {\n        message_id: msg.id,\n        headers,\n        message_id_header: messageIdHeader,\n        email_references: references,\n        in_reply_to: inReplyTo,\n        return_path: returnPath,\n        received_spf: receivedSpf,\n        dkim_signature: dkimSignature,\n        authentication_results: authResults\n      },\n      unsubscribe_link: listUnsubscribe,\n      list_id: listId,\n      precedence,\n      auto_submitted: autoSubmitted,\n      message_id_header: messageIdHeader,\n      email_references: references,\n      in_reply_to: inReplyTo\n    });\n  }\n\n  out.push({ json: { ...context, value: processedMessages } });\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -768,
+        -352
+      ],
+      "id": "0414b26a-6bb3-42cb-9a91-a0ac66cc6292",
+      "name": "parse_headers"
+    },
+    {
+      "parameters": {
+        "jsCode": "const SIZE_LIMIT = 25 * 1024 * 1024; // 25 MB\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const list = Array.isArray(item.json.value) ? item.json.value : [item.json];\n\n  // SÄILYTÄ KAIKKI OHJAUSKENTÄT\n  const context = {\n    '@odata.context': item.json['@odata.context'],\n    '@odata.deltaLink': item.json['@odata.deltaLink'],\n    '@odata.nextLink': item.json['@odata.nextLink'],\n    items_processed: item.json.items_processed,\n    items_processed_in_run: item.json.items_processed_in_run,\n    pages_in_run: item.json.pages_in_run,           // ← UUSI\n    this_page_count: item.json.this_page_count,     // ← UUSI\n    run_limit: item.json.run_limit,                 // ← UUSI\n    folder_name: item.json.folder_name,\n    folder_path: item.json.folder_path,\n    resource_path: item.json.resource_path,\n    user_upn: item.json.user_upn\n  };\n\n  const processedMessages = [];\n\n  for (const msg of list) {\n    const attachments = msg.attachments || [];\n    const attachmentsMetadata = [];\n    const attachmentReviewItems = [];\n\n    for (const att of attachments) {\n      const attId = att.id || null;\n      const attName = att.name || 'unnamed';\n      const contentType = att.contentType || 'application/octet-stream';\n      const sizeBytes = att.size || 0;\n      const isInline = att.isInline || false;\n      const contentId = att.contentId || null;\n\n      let attachmentType = 'other';\n      if (contentType.startsWith('image/')) attachmentType = 'image';\n      else if (contentType.includes('pdf')) attachmentType = 'pdf';\n      else if (contentType.includes('word') || contentType.includes('document')) attachmentType = 'document';\n      else if (contentType.includes('sheet') || contentType.includes('excel')) attachmentType = 'spreadsheet';\n      else if (contentType.includes('zip') || contentType.includes('compressed')) attachmentType = 'archive';\n\n      attachmentsMetadata.push({\n        message_id: msg.id,\n        attachment_id: attId,\n        name: attName,\n        content_type: contentType,\n        size_bytes: sizeBytes,\n        attachment_type: attachmentType,\n        is_inline: isInline,\n        content_id: contentId\n      });\n\n      const needsReview = sizeBytes > SIZE_LIMIT || attachmentType === 'archive' || contentType.includes('executable');\n      if (needsReview) {\n        attachmentReviewItems.push({\n          message_id: msg.id,\n          attachment_id: attId,\n          from_address: msg.from?.emailAddress?.address || null,\n          from_domain: msg.from?.emailAddress?.address?.split('@')[1]?.toLowerCase() || null,\n          subject: msg.subject,\n          received_datetime: msg.receivedDateTime,\n          attachment_name: attName,\n          content_type: contentType,\n          size_bytes: sizeBytes,\n          is_inline: isInline,\n          content_id: contentId,\n          review_notes: sizeBytes > SIZE_LIMIT ? 'File exceeds 25 MB limit' : 'Requires manual review'\n        });\n      }\n    }\n\n    processedMessages.push({\n      ...msg,\n      attachments_metadata: attachmentsMetadata,\n      attachment_review_items: attachmentReviewItems,\n      has_attachments: attachments.length > 0,\n      attachment_count: attachments.length\n    });\n  }\n\n  out.push({ json: { ...context, value: processedMessages } });\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -608,
+        -352
+      ],
+      "id": "574c8dcb-2b49-44e5-82cf-093bca67504e",
+      "name": "parse_attachments"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH emails AS (  -- ota koko email-objekti, jotta saat dedupe_keyn\n  SELECT jsonb_array_elements($1::jsonb) AS email\n),\nrows AS (        -- nosta headerit email-kontekstissa\n  SELECT\n    (email->>'message_id')::text                 AS src_message_id,\n    email->>'dedupe_key'                         AS dedupe_key,\n    (email->'email_headers'->>'message_id')::text          AS hdr_message_id,\n    (email->'email_headers'->'headers')::jsonb             AS headers,\n    email->'email_headers'->>'message_id_header'           AS message_id_header,\n    email->'email_headers'->>'email_references'            AS email_references,\n    email->'email_headers'->>'in_reply_to'                 AS in_reply_to,\n    email->'email_headers'->>'return_path'                 AS return_path,\n    email->'email_headers'->>'received_spf'                AS received_spf,\n    email->'email_headers'->>'dkim_signature'              AS dkim_signature,\n    NOW()                                                 AS created_at\n  FROM emails\n  WHERE email ? 'email_headers' AND email->'email_headers' IS NOT NULL\n),\neligible AS (  -- ratkaise kanoninen message_id\n  SELECT\n    COALESCE(m.message_id, r.src_message_id, r.hdr_message_id) AS message_id,\n    r.headers, r.message_id_header, r.email_references, r.in_reply_to,\n    r.return_path, r.received_spf, r.dkim_signature, r.created_at\n  FROM rows r\n  JOIN outlook.emails_ingest m\n    ON m.message_id = r.src_message_id\n    OR m.message_id = r.hdr_message_id\n    OR (r.dedupe_key IS NOT NULL AND m.dedupe_key = r.dedupe_key)\n),\nins AS (\n  INSERT INTO outlook.email_headers (\n    message_id, headers, message_id_header, email_references, in_reply_to,\n    return_path, received_spf, dkim_signature, created_at\n  )\n  SELECT\n    message_id, headers, message_id_header, email_references, in_reply_to,\n    return_path, received_spf, dkim_signature, created_at\n  FROM eligible\n  ON CONFLICT (message_id) DO NOTHING\n  RETURNING 1\n)\nSELECT\n  (SELECT COUNT(*) FROM rows)::int     AS candidates_count,\n  (SELECT COUNT(*) FROM eligible)::int AS eligible_count,\n  COUNT(*)::int                        AS inserted_count\nFROM ins;\n",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.emails_for_headers || []) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -656,
+        -880
+      ],
+      "id": "56885324-0834-47d5-a9af-77fea1e267b5",
+      "name": "upsert_email_headers",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH src AS (\n  SELECT \n    x.*,\n    $2::text AS user_upn\n  FROM jsonb_to_recordset($1::jsonb) AS x(\n    message_id               text,\n    internet_message_id      text,\n    conversation_id          text,\n    received_datetime        timestamptz,\n    sent_datetime            timestamptz,\n    created_datetime         timestamptz,\n    last_modified_datetime   timestamptz,\n    parent_folder_id         text,\n    folder_name              text,\n    folder_path              text,\n    from_address             text,\n    from_name                text,\n    from_domain              text,\n    sender_address           text,\n    reply_to_address         text,\n    to_recipients            jsonb,\n    cc_recipients            jsonb,\n    bcc_recipients           jsonb,\n    to_count                 int,\n    cc_count                 int,\n    bcc_count                int,\n    subject                  text,\n    importance               text,\n    sensitivity              text,\n    inference_classification text,\n    categories               jsonb,\n    flag_status              text,\n    is_read                  boolean,\n    is_draft                 boolean,\n    has_attachments          boolean,\n    body_preview             text,\n    unsubscribe_link         text,\n    list_id                  text,\n    precedence               text,\n    auto_submitted           text,\n    features                 jsonb,\n    processing_status        text,\n    dedupe_key               text,\n    content_hash             text,\n    web_link                 text,\n    message_id_header        text,\n    email_references         text,\n    in_reply_to              text\n  )\n)\nINSERT INTO outlook.emails_ingest (\n  message_id,\n  user_upn,\n  internet_message_id,\n  conversation_id,\n  received_datetime,\n  sent_datetime,\n  created_datetime,\n  last_modified_datetime,\n  parent_folder_id,\n  folder_name,\n  folder_path,\n  from_address,\n  from_name,\n  from_domain,\n  sender_address,\n  reply_to_address,\n  to_recipients,\n  cc_recipients,\n  bcc_recipients,\n  to_count,\n  cc_count,\n  bcc_count,\n  subject,\n  importance,\n  sensitivity,\n  inference_classification,\n  categories,\n  flag_status,\n  is_read,\n  is_draft,\n  has_attachments,\n  body_preview,\n  unsubscribe_link,\n  list_id,\n  precedence,\n  auto_submitted,\n  features,\n  processing_status,\n  dedupe_key,\n  content_hash,\n  web_link,\n  message_id_header,\n  email_references,\n  in_reply_to,\n  created_at,\n  updated_at\n)\nSELECT\n  s.message_id,\n  COALESCE(NULLIF(s.user_upn,''), '') AS user_upn,\n  s.internet_message_id,\n  s.conversation_id,\n  s.received_datetime,\n  s.sent_datetime,\n  s.created_datetime,\n  s.last_modified_datetime,\n  s.parent_folder_id,\n  s.folder_name,\n  s.folder_path,\n  s.from_address,\n  s.from_name,\n  s.from_domain,\n  s.sender_address,\n  s.reply_to_address,\n  s.to_recipients,\n  s.cc_recipients,\n  s.bcc_recipients,\n  s.to_count,\n  s.cc_count,\n  s.bcc_count,\n  s.subject,\n  s.importance,\n  s.sensitivity,\n  s.inference_classification,\n  CASE\n    WHEN jsonb_typeof(s.categories)='array'\n    THEN ARRAY(SELECT jsonb_array_elements_text(s.categories))::text[]\n    ELSE NULL::text[]\n  END AS categories,\n  s.flag_status,\n  s.is_read,\n  s.is_draft,\n  s.has_attachments,\n  s.body_preview,\n  s.unsubscribe_link,\n  s.list_id,\n  s.precedence,\n  s.auto_submitted,\n  s.features,\n  COALESCE(s.processing_status,'pending'),\n  s.dedupe_key,\n  s.content_hash,\n  s.web_link,\n  s.message_id_header,\n  s.email_references,\n  s.in_reply_to,\n  NOW(),\n  NOW()\nFROM src s\nON CONFLICT ON CONSTRAINT emails_ingest_dedupe_key_key DO UPDATE SET\n  user_upn                   = COALESCE(NULLIF(outlook.emails_ingest.user_upn,''), EXCLUDED.user_upn),\n  internet_message_id        = EXCLUDED.internet_message_id,\n  conversation_id            = EXCLUDED.conversation_id,\n  received_datetime          = EXCLUDED.received_datetime,\n  sent_datetime              = EXCLUDED.sent_datetime,\n  created_datetime           = EXCLUDED.created_datetime,\n  last_modified_datetime     = EXCLUDED.last_modified_datetime,\n  parent_folder_id           = EXCLUDED.parent_folder_id,\n  folder_name                = EXCLUDED.folder_name,\n  folder_path                = EXCLUDED.folder_path,\n  from_address               = EXCLUDED.from_address,\n  from_name                  = EXCLUDED.from_name,\n  from_domain                = EXCLUDED.from_domain,\n  sender_address             = EXCLUDED.sender_address,\n  reply_to_address           = EXCLUDED.reply_to_address,\n  to_recipients              = EXCLUDED.to_recipients,\n  cc_recipients              = EXCLUDED.cc_recipients,\n  bcc_recipients             = EXCLUDED.bcc_recipients,\n  to_count                   = EXCLUDED.to_count,\n  cc_count                   = EXCLUDED.cc_count,\n  bcc_count                  = EXCLUDED.bcc_count,\n  subject                    = EXCLUDED.subject,\n  importance                 = EXCLUDED.importance,\n  sensitivity                = EXCLUDED.sensitivity,\n  inference_classification   = EXCLUDED.inference_classification,\n  categories                 = EXCLUDED.categories,\n  flag_status                = EXCLUDED.flag_status,\n  is_read                    = EXCLUDED.is_read,\n  is_draft                   = EXCLUDED.is_draft,\n  has_attachments            = EXCLUDED.has_attachments,\n  body_preview               = EXCLUDED.body_preview,\n  unsubscribe_link           = EXCLUDED.unsubscribe_link,\n  list_id                    = EXCLUDED.list_id,\n  precedence                 = EXCLUDED.precedence,\n  auto_submitted             = EXCLUDED.auto_submitted,\n  features                   = EXCLUDED.features,\n  processing_status          = EXCLUDED.processing_status,\n  content_hash               = EXCLUDED.content_hash,\n  web_link                   = EXCLUDED.web_link,\n  message_id_header          = EXCLUDED.message_id_header,\n  email_references           = EXCLUDED.email_references,\n  in_reply_to                = EXCLUDED.in_reply_to,\n  updated_at                 = NOW();\n",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.emails), $json.user_upn ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -1088,
+        -1040
+      ],
+      "id": "1ee930aa-f1fa-4912-b059-666455116563",
+      "name": "upsert_emails",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH emails AS (                                   -- koko email-objekti mukaan\n  SELECT jsonb_array_elements($1::jsonb) AS email\n),\nrows AS (                                          -- räjäytä liitteet email-kontekstissa\n  SELECT\n    (email->>'message_id')::text                 AS src_message_id,\n    email->>'dedupe_key'                         AS dedupe_key,\n    att->>'attachment_id'                        AS attachment_id,\n    att->>'name'                                 AS name,\n    att->>'content_type'                         AS content_type,\n    NULLIF(att->>'size_bytes','')::bigint        AS size_bytes,\n    COALESCE(NULLIF(att->>'is_inline','')::boolean,false) AS is_inline,\n    att->>'content_id'                           AS content_id,\n    att->>'attachment_type'                      AS attachment_type,\n    NOW()                                        AS created_at\n  FROM emails\n  CROSS JOIN LATERAL jsonb_array_elements(COALESCE(email->'attachments_metadata','[]'::jsonb)) AS att\n),\neligible AS (                                      -- ratkaise kanoninen message_id\n  SELECT\n    COALESCE(m.message_id, r.src_message_id) AS message_id,  -- käytä kannan id:tä jos löytyy\n    r.attachment_id, r.name, r.content_type, r.size_bytes, r.is_inline,\n    r.content_id, r.attachment_type, r.created_at\n  FROM rows r\n  JOIN outlook.emails_ingest m\n    ON m.message_id = r.src_message_id\n    OR (r.dedupe_key IS NOT NULL AND m.dedupe_key = r.dedupe_key)\n),\nins AS (\n  INSERT INTO outlook.attachments (\n    message_id, attachment_id, name, content_type, size_bytes, is_inline, content_id, created_at, attachment_type\n  )\n  SELECT message_id, attachment_id, name, content_type, size_bytes, is_inline, content_id, created_at, attachment_type\n  FROM eligible\n  ON CONFLICT (message_id, attachment_id) DO NOTHING\n  RETURNING 1\n)\nSELECT\n  (SELECT COUNT(*) FROM rows)::int     AS candidates_count,\n  (SELECT COUNT(*) FROM eligible)::int AS eligible_count,\n  COUNT(*)::int                        AS inserted_count\nFROM ins;\n",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.emails_for_attachments || []) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -656,
+        -1040
+      ],
+      "id": "76191ace-3456-4ce9-972e-2bad468185cf",
+      "name": "upsert_attachments_metadata",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH emails AS (\n  SELECT\n    (email->>'message_id')::text                AS message_id,\n    (email->>'attachment_review_items')::jsonb  AS items\n  FROM jsonb_array_elements($1::jsonb) AS email\n),\nrows AS (\n  SELECT\n    e.message_id,\n    (it->>'attachment_id')::text                         AS attachment_id,\n    it->>'from_address'                                  AS from_address,\n    it->>'from_domain'                                   AS from_domain,\n    it->>'subject'                                       AS subject,\n    NULLIF(it->>'received_datetime','')::timestamptz     AS received_datetime,\n    it->>'attachment_name'                               AS attachment_name,\n    it->>'content_type'                                  AS content_type,\n    NULLIF(it->>'size_bytes','')::bigint                 AS size_bytes,\n    COALESCE(NULLIF(it->>'is_inline','')::boolean,false) AS is_inline,\n    it->>'content_id'                                    AS content_id,\n    it->>'review_notes'                                  AS review_notes\n  FROM emails e\n  CROSS JOIN LATERAL jsonb_array_elements(e.items) AS it\n  WHERE e.items IS NOT NULL AND jsonb_array_length(e.items) > 0\n),\neligible AS (\n  SELECT r.*\n  FROM rows r\n  JOIN outlook.emails_ingest m ON m.message_id = r.message_id\n),\nins AS (\n  INSERT INTO outlook.attachment_review_queue (\n    message_id, attachment_id, from_address, from_domain, subject,\n    received_datetime, attachment_name, content_type, size_bytes, is_inline,\n    content_id, review_notes, review_status, download_status, created_at\n  )\n  SELECT\n    message_id, attachment_id, from_address, from_domain, subject,\n    received_datetime, attachment_name, content_type, size_bytes, is_inline,\n    content_id, review_notes, 'pending', 'not_downloaded', NOW()\n  FROM eligible\n  ON CONFLICT (message_id, attachment_id) DO NOTHING\n  RETURNING 1\n)\nSELECT\n  (SELECT COUNT(*)::int FROM rows)     AS candidates_count,\n  (SELECT COUNT(*)::int FROM eligible) AS eligible_count,\n  COUNT(*)::int                        AS inserted_count\nFROM ins;\n",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.emails) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -672,
+        -672
+      ],
+      "id": "d49d59b4-6b11-4a75-a09d-c4bb48da6c61",
+      "name": "insert_attachment_review_queue",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.items_processed }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              },
+              "id": "9cd40b01-0f2f-4d06-b645-dc582fa7a0b6"
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -416,
+        -576
+      ],
+      "id": "12a7b5ac-a596-4189-83de-2511d13cb18f",
+      "name": "has_emails"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pidä vain emailit, joilla on received_datetime. Pudota tombstonet/@removed ja puutteelliset.\nreturn items.map(item => {\n  const j = item.json || {};\n  const arr = Array.isArray(j.emails) ? j.emails : [];\n\n  const passed = [];\n  let dropped = 0;\n\n  for (const e of arr) {\n    const isTombstone = e && (e['@removed'] || e.removed === true || e.tombstone === true);\n    const hasReceived = e && typeof e.received_datetime === 'string' && e.received_datetime.length > 0;\n    if (!isTombstone && hasReceived) {\n      passed.push(e);\n    } else {\n      dropped++;\n    }\n  }\n\n  j.emails = passed;                         // upsert_emails lukee tämän ($1)\n  j._filtered_stats = { total: arr.length, passed: passed.length, dropped }; // kevyt metriikka\n\n  return { json: j };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1280,
+        -1040
+      ],
+      "id": "fb3c8507-4caf-4f81-9e5c-43a3c230a645",
+      "name": "filter_full_emails"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Run Once for All Items\n// Lukee sekä j.emails että j.value. Ei hukkaa @removed-tietoa.\n// Tuottaa: emails = vain täydet rivit, meta_events = myös poistot (event_type='deleted').\n\nreturn items.map(item => {\n  const j = item.json ?? {};\n\n  // Lähde: käytä emails jos siinä on sisältöä, muuten value (Graph raw)\n  const src = (Array.isArray(j.emails) && j.emails.length > 0)\n    ? j.emails\n    : (Array.isArray(j.value) ? j.value : []);\n\n  const full = [];\n  const events = [];\n\n  for (const m of src) {\n    // Graph raw tunnistus\n    const rawGraph = (m && (m['@odata.type'] || m['@removed'] || typeof m.id === 'string')) ? m : null;\n\n    const isDeleted =\n      !!(m?.tombstone === true || m?.removed === true || m?.['@removed'] || rawGraph?.['@removed']);\n\n    const received =\n      m?.received_datetime ?? m?.receivedDateTime ?? null;\n\n    const hasReceived = typeof received === 'string' && received.length > 0;\n\n    // Täydet rivit upserttiin\n    if (!isDeleted && hasReceived) {\n      // Jos jo normalisoitu, käytä sellaisenaan\n      if (m?.message_id) {\n        full.push(m);\n      } else {\n        // Minimimapping Graph → normalized\n        full.push({\n          message_id: m?.id ?? null,\n          internet_message_id: m?.internetMessageId ?? null,\n          conversation_id: m?.conversationId ?? null,\n\n          received_datetime: m?.receivedDateTime ?? null,\n          sent_datetime: m?.sentDateTime ?? null,\n          created_datetime: m?.createdDateTime ?? null,\n          last_modified_datetime: m?.lastModifiedDateTime ?? null,\n\n          subject: m?.subject ?? null,\n          body_preview: m?.bodyPreview ?? null,\n          unique_body_preview: (m?.uniqueBody?.text ?? m?.uniqueBody?.content ?? null),\n\n          parent_folder_id: m?.parentFolderId ?? null,\n          is_read: m?.isRead ?? null,\n          has_attachments: m?.hasAttachments ?? false,\n          categories: Array.isArray(m?.categories) ? m.categories : [],\n        });\n      }\n      continue;\n    }\n\n    // Meta-/poistotapahtuma\n    const removed_reason =\n      m?.removed_reason ??\n      m?.['@removed']?.reason ??\n      rawGraph?.['@removed']?.reason ??\n      null;\n\n    events.push({\n      event_type: isDeleted ? 'deleted' : 'meta_changed',\n      message_id: m?.message_id ?? m?.id ?? null,\n      user_upn: j?.user_upn ?? j?.USER_UPN ?? null,\n      change_key: m?.change_key ?? m?.changeKey ?? null,\n      parent_folder_id: m?.parent_folder_id ?? m?.parentFolderId ?? null,\n      is_read: m?.is_read ?? m?.isRead ?? null,\n      flag_status: m?.flag_status ?? m?.flag?.flagStatus ?? null,\n      categories: Array.isArray(m?.categories) ? m.categories : [],\n      importance: m?.importance ?? null,\n      has_attachments: m?.has_attachments ?? m?.hasAttachments ?? null,\n      last_modified_datetime: m?.last_modified_datetime ?? m?.lastModifiedDateTime ?? null,\n      removed_reason,\n      is_deleted: !!isDeleted,\n\n      // Säilytä Graph raw tarkistusta varten\n      raw_graph: rawGraph ?? null,\n      raw: m ?? null,\n    });\n  }\n\n  return {\n    json: {\n      ...j,\n      emails: full,\n      meta_events: events,\n      _extract_stats: { total: src.length, to_upsert: full.length, to_meta: events.length },\n    },\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1312,
+        -752
+      ],
+      "id": "5bb2743e-1eb6-4a9d-a82e-2b9a351c06a3",
+      "name": "extract_meta_changes"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "5c6aba61-8f00-4221-a982-b0255cebcfdd",
+              "leftValue": "={{ $json.meta_events }}",
+              "rightValue": "",
+              "operator": {
+                "type": "array",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1088,
+        -752
+      ],
+      "id": "12bf3ded-bbc6-4b77-9b00-22fc9c661f86",
+      "name": "has_meta_events"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Mode: Run Once for All Items\n// Lukee meta_events ja ristiinmäpäyttää Graphin value[*] → event.id\n// Pakottaa event_type='deleted', jos value[id]['@removed'] löytyy.\n\nreturn items.flatMap(item => {\n  const j = item.json ?? {};\n  const value = Array.isArray(j.value) ? j.value : [];\n  const evs = Array.isArray(j.meta_events) ? j.meta_events : [];\n\n  // id → raw\n  const rawById = {};\n  for (const o of value) {\n    const rid = o?.id ?? o?.message_id ?? null;\n    if (rid) rawById[rid] = o;\n  }\n\n  const ctx = {\n    user_upn: j.user_upn ?? j.USER_UPN ?? null,\n    resource_path: j.resource_path ?? j.path ?? null,\n    folder_name: j.folder_name ?? null,\n    folder_id: j.folder_id ?? j.parent_folder_id ?? null,\n  };\n\n  return evs.map(e => {\n    const id = e?.message_id ?? e?.id ?? null;\n\n    // PRIORITEETTI: value[id] → e.raw_graph → e.raw\n    const rawPref = (id && rawById[id]) ? rawById[id] : null;\n    const raw = rawPref || e?.raw_graph || e?.raw || null;\n\n    const removedObj = raw?.['@removed'] || null;\n    const isDeleted = !!removedObj;\n    const removed_reason = removedObj?.reason ?? null;\n\n    return {\n      json: {\n        event_type: isDeleted ? 'deleted' : (e?.event_type ?? 'meta_changed'),\n        message_id: id ?? raw?.id ?? null,\n        user_upn: e?.user_upn ?? ctx.user_upn,\n        change_key: e?.change_key ?? e?.changeKey ?? null,\n        parent_folder_id: e?.parent_folder_id ?? raw?.parentFolderId ?? ctx.folder_id ?? null,\n        is_read: e?.is_read ?? raw?.isRead ?? null,\n        flag_status: e?.flag_status ?? (raw?.flag?.flagStatus ?? null),\n        categories: Array.isArray(e?.categories) ? e.categories : [],\n        importance: e?.importance ?? null,\n        has_attachments: e?.has_attachments ?? raw?.hasAttachments ?? null,\n        last_modified_datetime: e?.last_modified_datetime ?? raw?.lastModifiedDateTime ?? null,\n        removed_reason,\n        tombstone: isDeleted,\n        raw_graph: raw ?? null,\n        resource_path: ctx.resource_path,\n        folder_name: ctx.folder_name,\n        folder_id: ctx.folder_id,\n      },\n    };\n  });\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        -768
+      ],
+      "id": "89e25e5b-e335-4d6c-8499-fd63b04ccf62",
+      "name": "split_meta_event"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "caf7b846-fa2d-46da-9a7e-9c282fce46d2",
+              "leftValue": "={{ $json.event_type }}",
+              "rightValue": "deleted",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -272,
+        -848
+      ],
+      "id": "384ee759-a88b-40d3-aea4-195503d609e9",
+      "name": "apply_meta_change"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH u AS (\n  UPDATE outlook.emails_ingest\n  SET\n    is_deleted = TRUE,\n    deleted_at = NOW(),\n    updated_at = NOW()\n  WHERE message_id = TRIM($1::text)\n  RETURNING message_id\n)\nSELECT COUNT(*)::int AS updated_count FROM u;",
+        "options": {
+          "queryReplacement": "={{ [ $json.message_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -272,
+        -1136
+      ],
+      "id": "7a488b9d-93a8-412c-be33-a3d120272eec",
+      "name": "mark_deleted",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  TRIM($1::text)                             AS message_id,\n  COUNT(*)::int                              AS exists_count,\n  COALESCE(BOOL_OR(is_deleted), false)       AS already_deleted\nFROM outlook.emails_ingest\nWHERE message_id = TRIM($1::text);\n",
+        "options": {
+          "queryReplacement": "={{ [ $json.message_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -272,
+        -992
+      ],
+      "id": "8222fa57-4c9f-4113-adb4-ba775bb8ef3d",
+      "name": "check_row_exists",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// compact_for_next_page — kanna nextLink + JUOKSEVAT LASKURIT eteenpäin\n// Lähde laskureille: page_counter → calc_run_limit (fallback)\n\nfunction pickNext(j) {\n  return j.nextLink ?? j.next_link ?? j['@odata.nextLink'] ??\n         j?.metadata?.nextLink ?? j.url ?? j.resume_link ?? null;\n}\nfunction pickDelta(j) {\n  return j.deltaLink ?? j.delta_link ?? j['@odata.deltaLink'] ??\n         j?.metadata?.deltaLink ?? null;\n}\n\n// Nouda viimeisin laskuritieto rinnakkaissolmusta\nfunction pickCounters() {\n  let src = [];\n  try { src = $items('page_counter'); } catch {}\n  if (!src || !src.length) {\n    try { src = $items('calc_run_limit'); } catch {}\n  }\n  const slot = (src && src.length) ? (src[$itemIndex]?.json || src[src.length - 1]?.json || {}) : {};\n  return {\n    pages_in_run: Number(slot.pages_in_run || 0),\n    items_processed_in_run: Number(slot.items_processed_in_run || 0),\n  };\n}\n\nlet next = null, delta = null;\nlet user = null, path = null, folder = null;\n\nfor (const it of items) {\n  const j = it.json || {};\n  const n = pickNext(j);  if (n) next = n;\n  const d = pickDelta(j); if (d) delta = d;\n  user   = j.user_upn ?? j.USER_UPN ?? user;\n  path   = j.resource_path ?? j.path ?? path;\n  folder = j.folder_name ?? folder;\n}\n\nconst { pages_in_run, items_processed_in_run } = pickCounters();\n\nreturn [{\n  json: {\n    user_upn: user ?? null,\n    resource_path: path ?? null,\n    folder_name: folder ?? null,\n\n    // Linkit useilla aliaksilla\n    nextLink: next, next_link: next, url: next, resume_link: next,\n    deltaLink: delta, delta_link: delta,\n\n    // KRIITTINEN: kanna laskurit\n    pages_in_run,\n    items_processed_in_run\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -288,
+        -176
+      ],
+      "id": "42ff8501-a1c5-4503-a16d-052bf4e8ddf8",
+      "name": "compact_for_next_page"
+    },
+    {
+      "parameters": {
+        "jsCode": "// page_counter — pass-through, ei laskentaa\nreturn items.map(item => {\n  const j = item.json || {};\n\n  // Varmista numerotyypit, mutta ÄLÄ inkrementoi mitään\n  j.items_processed_in_run = Number(j.items_processed_in_run || 0);\n  j.this_page_count        = Number(j.this_page_count || 0);\n  j.pages_in_run           = Number(j.pages_in_run || 0);\n\n  return { json: j };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -288,
+        -352
+      ],
+      "id": "33805cd5-83aa-4985-ad63-33593a1aa32d",
+      "name": "page_counter"
+    },
+    {
+      "parameters": {
+        "jsCode": "// reset_run_counters Nollaa sivu- ja rivilaskurit uuden ajon alussa.\n// Nollaa sivu- ja rivilaskurit uuden ajon alussa itemiin.\nreturn items.map(it => {\n  const j = it.json || {};\n  j.pages_in_run = 0;\n  j.items_processed_in_run = 0;\n  j.this_page_count = 0;\n  return { json: j };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1376,
+        -352
+      ],
+      "id": "d96751a3-aa99-4df8-b5d5-162ad04a9c83",
+      "name": "reset_run_counters"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Hae sama suodatettu emails-lista filter_full_emails -solmulta\nfunction getFromNode(name) {\n  try {\n    const a = $items(name);\n    if (Array.isArray(a) && a.length) return a[$itemIndex]?.json || a[0]?.json || null;\n  } catch (e) {}\n  return null;\n}\nconst src = getFromNode('filter_full_emails');\nconst emails = (src && Array.isArray(src.emails)) ? src.emails : [];\n\nreturn items.map(it => {\n  const j = it.json || {};\n  j.emails_for_attachments = emails;\n  return { json: j };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -864,
+        -1040
+      ],
+      "id": "8e86784c-1f1d-4479-bbb6-f61aebaf0684",
+      "name": "relay_emails_for_attachments"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Kopioi sama suodatettu emails-lista filter_full_emails -solmulta\nfunction getFromNode(name){\n  try{ const a = $items(name); if(Array.isArray(a)&&a.length) return a[$itemIndex]?.json||a[0]?.json||null; }catch(e){}\n  return null;\n}\nconst src = getFromNode('filter_full_emails');\nconst emails = (src && Array.isArray(src.emails)) ? src.emails : [];\n\nreturn items.map(it => {\n  const j = it.json || {};\n  j.emails_for_headers = emails;\n  return { json: j };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -864,
+        -880
+      ],
+      "id": "680d30fc-b7a6-404a-8faf-da50f99bf7f3",
+      "name": "relay_emails_for_headers"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "4d5c7171-d748-4257-99a6-9a40cac1ef09",
+              "leftValue": "={{$json.items_processed_in_run}}",
+              "rightValue": "={{$node[\"set_config\"].json.MAX_ITEMS_PER_RUN ||70}}",
+              "operator": {
+                "type": "number",
+                "operation": "lt"
+              }
+            },
+            {
+              "id": "2297e012-7ca0-4998-b34c-4fd423eac886",
+              "leftValue": "={{ $json.nextLink || $json.next_link || $json['@odata.nextLink'] || ($json.metadata && $json.metadata.nextLink) }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "e88e3d64-4c93-4234-ba2c-bee59bbe3f6b",
+              "leftValue": "={{ $json.pages_in_run }}",
+              "rightValue": "={{$node[\"set_config\"].json.PAGES_PER_RUN || 7}}",
+              "operator": {
+                "type": "number",
+                "operation": "lt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -112,
+        -352
+      ],
+      "id": "26287cb2-2065-4519-9ca3-e81d6ee23be5",
+      "name": "should_continue"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -1568,
+        -1008
+      ],
+      "id": "d57d6b93-9d34-4e3b-8ba6-5c3dd4f24468",
+      "name": "Schedule Every 5 min"
+    }
+  ],
+  "connections": {
+    "prepare_delta_url": {
+      "main": [
+        [
+          {
+            "node": "reset_run_counters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "fetch_emails_http": {
+      "main": [
+        [
+          {
+            "node": "process_emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "save_delta_link": {
+      "main": [
+        []
+      ]
+    },
+    "set_config": {
+      "main": [
+        [
+          {
+            "node": "load_targets_saapuneet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "fetch_next_page": {
+      "main": [
+        [
+          {
+            "node": "process_emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "state_for_paging": {
+      "main": [
+        [
+          {
+            "node": "fetch_next_page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "map_ingest_min": {
+      "main": [
+        [
+          {
+            "node": "extract_meta_changes",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "insert_attachment_review_queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "save_progres": {
+      "main": [
+        [
+          {
+            "node": "compact_for_next_page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "has_next_link": {
+      "main": [
+        [
+          {
+            "node": "save_progres",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "can_save_delta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "calc_run_limit": {
+      "main": [
+        [
+          {
+            "node": "page_counter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "save_progress_only": {
+      "main": [
+        []
+      ]
+    },
+    "can_save_delta": {
+      "main": [
+        [
+          {
+            "node": "save_delta_link",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "save_progress_only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "process_emails": {
+      "main": [
+        [
+          {
+            "node": "parse_headers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "load_targets_saapuneet": {
+      "main": [
+        [
+          {
+            "node": "prepare_delta_url",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "parse_headers": {
+      "main": [
+        [
+          {
+            "node": "parse_attachments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "parse_attachments": {
+      "main": [
+        [
+          {
+            "node": "has_emails",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "calc_run_limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "upsert_emails": {
+      "main": [
+        [
+          {
+            "node": "relay_emails_for_attachments",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "relay_emails_for_headers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "has_emails": {
+      "main": [
+        [
+          {
+            "node": "map_ingest_min",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "filter_full_emails": {
+      "main": [
+        [
+          {
+            "node": "upsert_emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "extract_meta_changes": {
+      "main": [
+        [
+          {
+            "node": "has_meta_events",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "filter_full_emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "has_meta_events": {
+      "main": [
+        [
+          {
+            "node": "split_meta_event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "split_meta_event": {
+      "main": [
+        [
+          {
+            "node": "apply_meta_change",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "apply_meta_change": {
+      "main": [
+        [
+          {
+            "node": "check_row_exists",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "check_row_exists": {
+      "main": [
+        [
+          {
+            "node": "mark_deleted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "compact_for_next_page": {
+      "main": [
+        [
+          {
+            "node": "state_for_paging",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "page_counter": {
+      "main": [
+        [
+          {
+            "node": "should_continue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "reset_run_counters": {
+      "main": [
+        [
+          {
+            "node": "fetch_emails_http",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "relay_emails_for_attachments": {
+      "main": [
+        [
+          {
+            "node": "upsert_attachments_metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "relay_emails_for_headers": {
+      "main": [
+        [
+          {
+            "node": "upsert_email_headers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "should_continue": {
+      "main": [
+        [
+          {
+            "node": "has_next_link",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "can_save_delta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Every 5 min": {
+      "main": [
+        [
+          {
+            "node": "set_config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "5bc588890427261aec904f1de6ea2c47f92f0021d7680fbf9bd2043a6f4924b2"
+  }
+}

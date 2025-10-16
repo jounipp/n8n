@@ -1,0 +1,1160 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "path": "graph/mail",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1072,
+        -256
+      ],
+      "id": "a87bd992-eecf-4566-9328-a63d36b55d2a",
+      "name": "webhook_validate",
+      "webhookId": "graph-mail-validate"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "graph/mail",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1216,
+        -64
+      ],
+      "id": "85a804b2-6658-45b9-97de-1de12ea01e71",
+      "name": "webhook_change",
+      "webhookId": "graph-mail-change"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.query.validationToken }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/plain"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -880,
+        -256
+      ],
+      "id": "4c12325e-3a49-49d6-a1dd-d13f2bcc359a",
+      "name": "respond_validation"
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "CLIENT_STATE",
+              "value": "n8n_graph_14O7_7539"
+            },
+            {
+              "name": "USER_UPN",
+              "value": "jouni.pappila@repoxcapital.fi"
+            }
+          ]
+        },
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        -64
+      ],
+      "id": "b40302a9-8ea5-4cef-823b-0a37f2ab97a2",
+      "name": "config_env"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== POST WEBHOOK HANDLER =====\n// Käsittelee vain POST-muutosilmoitukset (GET menee omaan webhookiinsa)\n\n// Hae konfiguraatio\nconst CONFIG = {\n  CLIENT_STATE: $node[\"config_env\"].json.CLIENT_STATE,\n  USER_UPN: $node[\"config_env\"].json.USER_UPN,\n  ALLOWED_CHANGE_TYPES: ['created', 'updated', 'deleted']\n};\n\n// POST data\nconst headers = $json.headers || {};\nconst body = $json.body || {};\n\n// Varmista että notifications on aina taulukko\nconst notifications = Array.isArray(body.value) ? body.value : [];\n\n// Tarkista Content-Type (case-insensitive, salli charset)\nconst contentType = (headers['content-type'] || headers['Content-Type'] || '').toLowerCase();\nif (!contentType.includes('application/json')) {\n  return [{\n    json: {\n      error: true,\n      errorType: 'invalid_content_type',\n      reason: 'Invalid Content-Type',\n      expected: 'application/json',\n      received: headers['content-type'] || headers['Content-Type'] || 'missing',\n      payload: body,\n      timestamp: new Date().toISOString()\n    }\n  }];\n}\n\n// Jos ei notifikaatioita\nif (notifications.length === 0) {\n  return [{\n    json: {\n      error: true,\n      errorType: 'no_notifications',\n      reason: 'No notifications in POST body',\n      payload: body,\n      timestamp: new Date().toISOString()\n    }\n  }];\n}\n\n// Käsittele jokainen notifikaatio erikseen (1→1)\nconst output = [];\n\nfor (const notification of notifications) {\n  // Validoi clientState turvallisuuden vuoksi\n  if (notification.clientState !== CONFIG.CLIENT_STATE) {\n    output.push({\n      json: {\n        error: true,\n        errorType: 'client_state_mismatch',\n        reason: 'ClientState mismatch - security violation',\n        expected: CONFIG.CLIENT_STATE,\n        received: notification.clientState,\n        subscriptionId: notification.subscriptionId,\n        payload: notification,\n        timestamp: new Date().toISOString()\n      }\n    });\n    continue;\n  }\n  \n  // Validoi changeType\n  const changeType = notification.changeType;\n  if (!CONFIG.ALLOWED_CHANGE_TYPES.includes(changeType)) {\n    output.push({\n      json: {\n        error: true,\n        errorType: 'invalid_change_type',\n        reason: 'Invalid changeType',\n        allowed: CONFIG.ALLOWED_CHANGE_TYPES,\n        received: changeType,\n        payload: notification,\n        timestamp: new Date().toISOString()\n      }\n    });\n    continue;\n  }\n  \n  // Validoi resourceData.id (message_id)\n  const messageId = notification.resourceData?.id;\n  if (!messageId) {\n    output.push({\n      json: {\n        error: true,\n        errorType: 'missing_message_id',\n        reason: 'Missing resourceData.id (message_id)',\n        payload: notification,\n        timestamp: new Date().toISOString()\n      }\n    });\n    continue;\n  }\n  \n  // Rakenna normalisoitu eventti\n  output.push({\n    json: {\n      // Pakolliset kentät\n      user_upn: CONFIG.USER_UPN,\n      message_id: messageId,\n      changeType: changeType,\n      resource: notification.resource,\n      subscriptionId: notification.subscriptionId,\n      clientState: notification.clientState,\n      received_at: new Date().toISOString(),\n      error: false,\n      \n      // Säilytä kaikki metadata\n      metadata: {\n        tenantId: notification.tenantId,\n        subscriptionExpirationDateTime: notification.subscriptionExpirationDateTime,\n        resourceData: notification.resourceData,\n        etag: notification.resourceData?.['@odata.etag'],\n        odataId: notification.resourceData?.['@odata.id'],\n        odataType: notification.resourceData?.['@odata.type']\n      }\n    }\n  });\n}\n\n// Jos ei yhtään itemiä tuotettu\nif (output.length === 0) {\n  output.push({\n    json: {\n      error: true,\n      errorType: 'no_valid_events',\n      reason: 'No valid events processed from notifications',\n      notificationCount: notifications.length,\n      timestamp: new Date().toISOString()\n    }\n  });\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -720,
+        -64
+      ],
+      "id": "76aa9de8-257f-4e45-8cb8-194ec1c14ead",
+      "name": "process_webhook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.error}}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              },
+              "id": "47534c8d-c58f-409d-a13d-22e3f5fed87d"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -560,
+        -64
+      ],
+      "id": "2a7a064a-8f8a-4e4d-9cdb-784ca213bd3a",
+      "name": "filter_errors"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outlook.process_log (\n  workflow_name, \n  operation, \n  stage, \n  user_upn, \n  message_id,\n  started_at, \n  completed_at, \n  detail, \n  error_message, \n  items_processed, \n  items_failed\n)\nVALUES (\n  'outlook_orchestrator',\n  'webhook_error',\n  $1,  -- errorType\n  $2,  -- user_upn or null\n  $3,  -- message_id or null\n  NOW(),\n  NOW(),\n  $4::jsonb,  -- full error details\n  $5,  -- error reason\n  0,\n  1\n);",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.errorType || 'unknown',\n  $json.user_upn || null,\n  $json.message_id || null,\n  JSON.stringify($json),\n  $json.reason || 'Unknown error'\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -208,
+        544
+      ],
+      "id": "2c49177b-5077-4187-a339-2a37d05884cb",
+      "name": "log_error",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== NORMALIZE EVENT =====\n// Varmista että data on oikeassa muodossa jatkokäsittelyä varten\n\nconst event = $json;\n\n// Rakenna normalisoitu eventti\nconst normalized = {\n  // Pakolliset kentät\n  user_upn: event.user_upn,\n  message_id: event.message_id,\n  changeType: event.changeType,\n  resource: event.resource,\n  \n  // Aikaleima\n  received_at: event.received_at || new Date().toISOString(),\n  \n  // Subscription tiedot\n  subscriptionId: event.subscriptionId,\n  clientState: event.clientState,\n  \n  // Metadata säilytetään sellaisenaan\n  metadata: event.metadata || {},\n  \n  // Lisätään prosessointitiedot\n  processing: {\n    workflow: 'outlook_orchestrator',\n    stage: 'normalized',\n    timestamp: new Date().toISOString()\n  }\n};\n\n// Parsitaan resource polku tarkemmin\n// Esim: \"Users/xxx/Messages/yyy\" → resourceType\nif (normalized.resource) {\n  const resourceLower = normalized.resource.toLowerCase();\n  if (resourceLower.includes('/messages/')) {\n    normalized.resourceType = 'message';\n  } else if (resourceLower.includes('/mailfolders/')) {\n    normalized.resourceType = 'folder';\n  } else if (resourceLower.includes('/events/')) {\n    normalized.resourceType = 'event';\n  } else {\n    normalized.resourceType = 'unknown';\n  }\n}\n\nreturn [{ json: normalized }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -560,
+        176
+      ],
+      "id": "763582fe-f309-4ab2-8717-8ce4cf3d020d",
+      "name": "normalize_event"
+    },
+    {
+      "parameters": {
+        "respondWith": "noData",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1024,
+        544
+      ],
+      "id": "ac66576d-f188-4f3a-b75a-f8d519d1edda",
+      "name": "respond_post_success"
+    },
+    {
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.changeType }}",
+        "rules": {
+          "rules": [
+            {
+              "value2": "created"
+            },
+            {
+              "value2": "updated"
+            },
+            {
+              "value2": "deleted"
+            },
+            {
+              "value2": "fallback output"
+            }
+          ]
+        },
+        "fallbackOutput": 3
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 2,
+      "position": [
+        -560,
+        608
+      ],
+      "id": "1bda7e62-d3a4-47eb-8cd5-6b9a6d1e02d9",
+      "name": "route_by_changetype"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== ROUTE CREATED =====\n// Välitä data ensure_snapshot solmulle\nconst event = $json;\n\n// Välitä data sellaisenaan eteenpäin\nreturn [{ json: event }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -304,
+        -16
+      ],
+      "id": "e498fab1-c623-4b34-afa8-230710b0cdfb",
+      "name": "route_created"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== ROUTE UPDATED =====\n// Välitä data ensure_snapshot solmulle\nconst event = $json;\n\n// Välitä data sellaisenaan eteenpäin\nreturn [{ json: event }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -304,
+        176
+      ],
+      "id": "79422898-299c-47e6-aad6-51b3ddcebda4",
+      "name": "route_updated"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ensure_snapshot: päätä tarvitaanko täydentävä viestihaku Graphista\n\nconst ev = $json || {};\nconst rd = ev?.metadata?.resourceData || {};\n\nconst missing = [];\n\n// Vain viestit kelpaavat tähän putkeen\nif (ev.resourceType !== 'message') {\n  missing.push('resourceType!=message');\n}\n\n// Tarkistettavat kentät\nif (typeof rd.isRead !== 'boolean') missing.push('isRead');\nif (!Array.isArray(rd.categories)) missing.push('categories');\nconst flagStatus = rd?.flag?.flagStatus;\nif (!['notFlagged','flagged','complete'].includes(flagStatus)) missing.push('flag.flagStatus');\nif (!rd.parentFolderId) missing.push('parentFolderId');\n\nconst needFetch = missing.length > 0;\n\nreturn [{\n  json: {\n    ...ev,\n    ensure_snapshot: {\n      needFetch,\n      missingFields: missing\n    },\n    processing: {\n      ...(ev.processing || {}),\n      stage: needFetch ? 'ensure_snapshot:fetch_needed' : 'ensure_snapshot:ok',\n      timestamp: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -96,
+        -176
+      ],
+      "id": "ff3b56e3-e91d-4e14-ba24-fad1a08b0b47",
+      "name": "ensure_snapshot"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ensure_snapshot.needFetch }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "2561c1ec-5e7f-43e3-8571-5fc71b0d8eb9"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        64,
+        -192
+      ],
+      "id": "5c7aa251-1466-4d32-9290-115fa24204a3",
+      "name": "check_need_fetch"
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.microsoft.com/v1.0/users/{{ $json.user_upn }}/messages/{{ $json.message_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$select",
+              "value": "id,receivedDateTime,parentFolderId,subject,from,isRead,isDraft,flag,importance,categories,conversationId,internetMessageId"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        -192
+      ],
+      "id": "57a3f619-5f68-4eb7-9715-ff5ead0f6083",
+      "name": "get_message",
+      "credentials": {
+        "oAuth2Api": {
+          "id": "wINgbOJ2X4ZzA7NV",
+          "name": "Graph Outlook"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// folder_resolve: valmistele kansion resolvointi cachesta\n\nconst ev = $json || {};\nconst rd = ev?.metadata?.resourceData || {};\n\nconst parentFolderId = rd?.parentFolderId || null;\n\nconst out = {\n  ...ev,\n  folder_resolve: {\n    parentFolderId: parentFolderId,\n    user_upn: ev.user_upn || null,\n    cache_hit: false,\n    folder_name: null,\n    folder_path: null,\n    folder_id: null,\n    needCacheLookup: !!parentFolderId,     // true jos on mitä hakea\n    reason: null,\n  },\n  processing: {\n    ...(ev.processing || {}),\n    stage: 'folder_resolve:prep',\n    timestamp: new Date().toISOString()\n  }\n};\n\nif (!parentFolderId) {\n  out.folder_resolve.needCacheLookup = false;\n  out.folder_resolve.reason = 'missing_parentFolderId';\n}\n\nreturn [{ json: out }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -48,
+        48
+      ],
+      "id": "7d53a1b0-f7e4-4ef4-af1c-56a66b372a1e",
+      "name": "folder_resolve"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT folder_id, display_name as folder_name, folder_path \nFROM outlook.folders_cache \nWHERE folder_id = $1\nLIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ [ $json.folder_resolve.parentFolderId ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        144,
+        48
+      ],
+      "id": "fd386eea-ae8d-4df7-959e-ea6e93ea09be",
+      "name": "folders_cache_lookup",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// merge_folder_resolve: yhdistä cache-haun tulos eventtiin\n\n// Hae alkuperäinen eventti folder_resolve solmusta\nlet originalEvent = null;\ntry {\n  const items = $items('folder_resolve');\n  if (items && items.length > 0) {\n    originalEvent = items[0].json;\n  }\n} catch (e) {}\n\nif (!originalEvent) {\n  return [{\n    json: {\n      error: true,\n      errorType: 'merge_folder_failed',\n      reason: 'Could not find original event from folder_resolve',\n      processing: { stage: 'merge_folder_resolve:error', timestamp: new Date().toISOString() }\n    }\n  }];\n}\n\n// Postgres solmun tulos\nconst dbResult = $json;\nconst hasResult = dbResult && dbResult.folder_id;\n\nif (hasResult) {\n  // Cache osuma - päivitä folder_resolve tiedot\n  return [{\n    json: {\n      ...originalEvent,\n      folder_resolve: {\n        ...originalEvent.folder_resolve,\n        cache_hit: true,\n        folder_name: dbResult.folder_name || null,\n        folder_path: dbResult.folder_path || null,\n        folder_id: dbResult.folder_id || null,\n        reason: 'cache_hit'\n      },\n      processing: {\n        ...(originalEvent.processing || {}),\n        stage: 'merge_folder_resolve:cache_hit',\n        timestamp: new Date().toISOString()\n      }\n    }\n  }];\n} else {\n  // Cache miss tai ei parentFolderId:tä\n  return [{\n    json: {\n      ...originalEvent,\n      folder_resolve: {\n        ...originalEvent.folder_resolve,\n        cache_hit: false,\n        reason: originalEvent.folder_resolve.needCacheLookup ? 'cache_miss' : originalEvent.folder_resolve.reason\n      },\n      processing: {\n        ...(originalEvent.processing || {}),\n        stage: 'merge_folder_resolve:cache_miss',\n        timestamp: new Date().toISOString()\n      }\n    }\n  }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        336,
+        32
+      ],
+      "id": "8b481f0e-9c37-4fbe-b7d6-e258b1cc8e22",
+      "name": "merge_folder_resolve"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.folder_resolve.cache_hit }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "b45631b4-8ea4-496b-ae0b-a3a1ace94274"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        496,
+        0
+      ],
+      "id": "e41b123e-eb1f-4eb1-9bc3-afa82c2e76b2",
+      "name": "if_cache_hit"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.emails_ingest\nSET\n  is_read                = COALESCE($1::boolean, is_read),\n  flag_status            = COALESCE($2::text, flag_status),\n  categories             = COALESCE($3::text[], categories),\n  parent_folder_id       = COALESCE($4::text, parent_folder_id),\n  folder_name            = COALESCE($5::text, folder_name),\n  folder_path            = COALESCE($6::text, folder_path),\n  last_modified_datetime = GREATEST(COALESCE(last_modified_datetime, '-infinity'),\n                                    COALESCE($7::timestamptz, '-infinity')),\n  updated_at             = NOW()\nWHERE message_id = $8;",
+        "options": {
+          "queryReplacement": "={{ [\n  // $1 is_read\n  $json.metadata?.resourceData?.isRead,\n\n  // $2 flag_status\n  ($json.metadata?.resourceData?.flag?.flagStatus) || null,\n\n  // $3 categories[]  (array or null)\n  Array.isArray($json.metadata?.resourceData?.categories) ? $json.metadata.resourceData.categories : null,\n\n  // $4 parent_folder_id (from cache or Graph)\n  $json.folder_resolve?.folder_id || $json.folder_resolve?.parentFolderId || null,\n\n  // $5 folder_name (from cache)\n  $json.folder_resolve?.folder_name || null,\n\n  // $6 folder_path (from cache)\n  $json.folder_resolve?.folder_path || null,\n\n  // $7 last_modified_datetime\n  $json.metadata?.resourceData?.receivedDateTime || $json.received_at || null,\n\n  // $8 message_id\n  $json.message_id\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        320,
+        432
+      ],
+      "id": "1f98c63f-434a-47b3-82f1-6bc75ae6bd8d",
+      "name": "apply_db_update",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.emails_ingest\nSET is_deleted = FALSE,\n    deleted_at = NULL,\n    updated_at = NOW()\nWHERE message_id = $1\n  AND is_deleted = TRUE;",
+        "options": {
+          "queryReplacement": "={{ [ $json.message_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        512,
+        432
+      ],
+      "id": "e2e0a4ef-f9d4-4d74-9914-97346f6c9498",
+      "name": "ensure_restore_status",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.microsoft.com/v1.0/users/{{ $json.user_upn }}/mailFolders/{{ $json.folder_resolve.parentFolderId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$select",
+              "value": "id,displayName,parentFolderId,childFolderCount"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -48,
+        224
+      ],
+      "id": "41cbeaec-230b-4fc5-a30f-717352172ea1",
+      "name": "refresh_folder_cache",
+      "credentials": {
+        "oAuth2Api": {
+          "id": "wINgbOJ2X4ZzA7NV",
+          "name": "Graph Outlook"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// merge_folder_from_graph: yhdistä Graph-kansiovaste eventtiin\n// Input 1: Graph GET /mailFolders/{id} -vastuu (this $json)\n// Tarvitsemme myös alkuperäisen eventin → haetaan merge_folder_resolve -solmusta\n\nconst graphFolder = $json || {};\nlet originalEvent = null;\n\ntry {\n  const items = $items('merge_folder_resolve');\n  if (items && items.length > 0) originalEvent = items[0].json;\n} catch (e) {}\n\nif (!originalEvent) {\n  return [{\n    json: {\n      error: true,\n      errorType: 'merge_folder_from_graph_failed',\n      reason: 'Missing original event from merge_folder_resolve',\n      processing: { stage: 'merge_folder_from_graph:error', timestamp: new Date().toISOString() }\n    }\n  }];\n}\n\nif (!graphFolder || !graphFolder.id) {\n  // Graph ei palauttanut kansiota → jatka cache-miss -polulla\n  return [{\n    json: {\n      ...originalEvent,\n      folder_resolve: {\n        ...(originalEvent.folder_resolve || {}),\n        cache_hit: false,\n        reason: 'graph_folder_not_found'\n      },\n      processing: { ...(originalEvent.processing||{}), stage: 'merge_folder_from_graph:miss', timestamp: new Date().toISOString() }\n    }\n  }];\n}\n\n// Päivitä kansion tiedot eventtiin (nimi ja polku voivat puuttua nyt → täydennetään upsertissa)\nconst displayName = graphFolder.displayName || null;\n\nreturn [{\n  json: {\n    ...originalEvent,\n    folder_resolve: {\n      ...(originalEvent.folder_resolve || {}),\n      cache_hit: false,\n      reason: 'cache_miss_resolved_from_graph',\n      folder_id: graphFolder.id,\n      folder_name: displayName,\n      // folder_path täydennetään upsertin jälkeen jos jo tiedossa\n    },\n    graph_folder: {\n      id: graphFolder.id,\n      displayName: displayName,\n      parentFolderId: graphFolder.parentFolderId || null,\n      childFolderCount: graphFolder.childFolderCount ?? null,\n      fetchedAt: new Date().toISOString()\n    },\n    processing: { ...(originalEvent.processing||{}), stage: 'merge_folder_from_graph:ok', timestamp: new Date().toISOString() }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        144,
+        224
+      ],
+      "id": "e694e1a8-7a8d-42e0-9d59-5edb9b52054d",
+      "name": "merge_folder_from_graph"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outlook.folders_cache\n  (folder_id, display_name, parent_folder_id, folder_path, updated_at)\nVALUES\n  ($1, $2, $3, COALESCE($4, NULL), NOW())\nON CONFLICT (folder_id) DO UPDATE\nSET\n  display_name      = EXCLUDED.display_name,\n  parent_folder_id  = EXCLUDED.parent_folder_id,\n  folder_path       = COALESCE(EXCLUDED.folder_path, outlook.folders_cache.folder_path),\n  updated_at        = NOW();",
+        "options": {
+          "queryReplacement": "={{ [\n  // $1 folder_id\n  $json.graph_folder?.id || $json.folder_resolve?.folder_id,\n\n  // $2 display_name\n  $json.graph_folder?.displayName || $json.folder_resolve?.folder_name || null,\n\n  // $3 parent_folder_id\n  $json.graph_folder?.parentFolderId || null,\n\n  // $4 folder_path (jos tiedossa, muuten jätetään NULL → ei ylikirjoita)\n  $json.folder_resolve?.folder_path || null\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        336,
+        224
+      ],
+      "id": "be7fc496-91b9-41e2-93bc-95b5dec93577",
+      "name": "folders_cache_upsert",
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT folder_id, display_name AS folder_name, folder_path\nFROM outlook.folders_cache\nWHERE folder_id = $1\nLIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ [ $json.graph_folder?.id || $json.folder_resolve?.folder_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        528,
+        208
+      ],
+      "id": "0edcd5e7-0d35-43a8-b933-de83843d9346",
+      "name": "folders_cache_readback",
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// merge_folder_cache_into_event: lisää upsertin jälkeen varmistettu nimi+polku eventtiin\nconst row = $json || {};\n\nlet ev = null;\ntry {\n  const items = $items('merge_folder_from_graph');  // polku: refresh_folder_cache → merge_folder_from_graph → folders_cache_upsert → readback\n  if (items && items.length > 0) ev = items[0].json;\n} catch (e) {}\n\nif (!ev) {\n  return [{\n    json: {\n      error: true,\n      errorType: 'merge_folder_cache_into_event_failed',\n      reason: 'Missing original event from merge_folder_from_graph',\n      processing: { stage: 'merge_folder_cache_into_event:error', timestamp: new Date().toISOString() }\n    }\n  }];\n}\n\n// Päivitä folder_resolve blokki varmoilla arvoilla\nconst folderName = row.folder_name || ev.folder_resolve?.folder_name || null;\nconst folderPath = row.folder_path || ev.folder_resolve?.folder_path || null;\nconst folderId   = row.folder_id   || ev.folder_resolve?.folder_id   || null;\n\nreturn [{\n  json: {\n    ...ev,\n    folder_resolve: {\n      ...(ev.folder_resolve || {}),\n      cache_hit: true,                  // nyt nimi ja polku varmistettu\n      folder_name: folderName,\n      folder_path: folderPath,\n      folder_id: folderId,\n      reason: 'cache_refreshed'\n    },\n    processing: {\n      ...(ev.processing || {}),\n      stage: 'merge_folder_cache_into_event:ok',\n      timestamp: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        128,
+        432
+      ],
+      "id": "d71b3c24-5803-4a3b-9458-66fc814c1cc9",
+      "name": "merge_folder_cache_into_event"
+    },
+    {
+      "parameters": {
+        "jsCode": "// skip_noop_updates: ohita turhat UPDATEt\nconst ev = $json || {};\nconst rd = ev?.metadata?.resourceData || {};\nconst incoming = {\n  isRead: rd?.isRead,\n  flagStatus: rd?.flag?.flagStatus || null,\n  categories: Array.isArray(rd?.categories) ? [...rd.categories].sort() : null,\n  parentFolderId: rd?.parentFolderId || null,\n};\n\nconst prev = {\n  isRead: ev?.prev?.isRead ?? null,\n  flagStatus: ev?.prev?.flagStatus ?? null,\n  categories: Array.isArray(ev?.prev?.categories) ? [...ev.prev.categories].sort() : null,\n  parentFolderId: ev?.prev?.parentFolderId ?? null,\n};\n\n// Jos ei ole \"prev\"-arvoja, ei voida varmistaa no-op → päivitä\nif (!ev.prev) {\n  return [{ json: { ...ev, skip_update: false, processing: { ...(ev.processing||{}), stage: 'skip_noop_updates:no_prev', timestamp: new Date().toISOString() } } }];\n}\n\nconst sameIsRead = (incoming.isRead === prev.isRead);\nconst sameFlag   = (incoming.flagStatus === prev.flagStatus);\nconst sameCats   = (JSON.stringify(incoming.categories) === JSON.stringify(prev.categories));\nconst sameFolder = (incoming.parentFolderId === prev.parentFolderId);\n\nconst isNoop = sameIsRead && sameFlag && sameCats && sameFolder;\n\nreturn [{\n  json: {\n    ...ev,\n    skip_update: isNoop,\n    processing: { ...(ev.processing||{}), stage: isNoop ? 'skip_noop_updates:skip' : 'skip_noop_updates:update', timestamp: new Date().toISOString() }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        -16
+      ],
+      "id": "29ad30b3-63aa-4fd7-ab3a-8e2613e5dc49",
+      "name": "skip_noop_updates"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.skip_update }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "f6d102fc-5879-47d1-820c-96e4399aeaaa"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        736,
+        224
+      ],
+      "id": "b0f210f8-f5cf-41c8-bcdc-62852e169029",
+      "name": "check_skip_update"
+    },
+    {
+      "parameters": {
+        "jsCode": "// merge_snapshot: liitä GET /messages/{id} -vaste eventtiin\n// HTTP Request palauttaa vain Graph vastauksen, haetaan alkuperäinen eventti\n\n// Graph API vastaus (get_message output)\nconst graphResponse = $json;\n\n// Hae alkuperäinen eventti check_need_fetch solmusta\nlet originalEvent = null;\ntry {\n  const items = $items('check_need_fetch');\n  if (items && items.length > 0) {\n    originalEvent = items[0].json;\n  }\n} catch (e) {\n  // Jos ei saada check_need_fetch:sta, yritä ensure_snapshot\n  try {\n    const items2 = $items('ensure_snapshot');\n    if (items2 && items2.length > 0) {\n      originalEvent = items2[0].json;\n    }\n  } catch (e2) {}\n}\n\nif (!originalEvent) {\n  return [{\n    json: {\n      error: true,\n      errorType: 'snapshot_merge_failed',\n      reason: 'Could not find original event',\n      graphResponse: graphResponse,\n      processing: { stage: 'merge_snapshot:error', timestamp: new Date().toISOString() }\n    }\n  }];\n}\n\nif (!graphResponse || !graphResponse.id) {\n  return [{\n    json: {\n      ...originalEvent,\n      error: true,\n      errorType: 'snapshot_merge_failed',\n      reason: 'Missing or invalid Graph message response',\n      processing: { ...(originalEvent.processing||{}), stage: 'merge_snapshot:error', timestamp: new Date().toISOString() }\n    }\n  }];\n}\n\n// Päivitä resourceData Graph API vastauksella\nconst rd = {\n  ...(originalEvent?.metadata?.resourceData || {}),\n  id: graphResponse.id,\n  isRead: graphResponse.isRead,\n  categories: Array.isArray(graphResponse.categories) ? graphResponse.categories : [],\n  flag: graphResponse.flag || { flagStatus: 'notFlagged' },\n  parentFolderId: graphResponse.parentFolderId,\n  conversationId: graphResponse.conversationId,\n  internetMessageId: graphResponse.internetMessageId,\n  subject: graphResponse.subject,\n  receivedDateTime: graphResponse.receivedDateTime,\n  from: graphResponse.from,\n  isDraft: graphResponse.isDraft,\n  importance: graphResponse.importance,\n};\n\nreturn [{\n  json: {\n    ...originalEvent,\n    // Ylikirjoita metadata.resourceData tuoreella\n    metadata: {\n      ...(originalEvent.metadata || {}),\n      resourceData: rd,\n      fetchedAt: new Date().toISOString()\n    },\n    ensure_snapshot: {\n      needFetch: false,\n      missingFields: []\n    },\n    processing: {\n      ...(originalEvent.processing || {}),\n      stage: 'merge_snapshot:ok',\n      timestamp: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        -208
+      ],
+      "id": "9bba07fe-18b2-4b68-8395-45293d69fe19",
+      "name": "merge_snapshot"
+    },
+    {
+      "parameters": {
+        "jsCode": "// route_deleted: normalisoi delete-eventti DB-päivitystä varten\nconst ev = $json || {};\nconst msgId = ev.message_id || ev?.metadata?.resourceData?.id || null;\n\nreturn [{\n  json: {\n    ...ev,\n    deletion: {\n      message_id: msgId,\n      user_upn: ev.user_upn || null,\n      is_deleted: true,\n      deleted_at: new Date().toISOString(),\n      reason: 'webhook_deleted'\n    },\n    processing: {\n      ...(ev.processing || {}),\n      stage: 'route_deleted:ready',\n      timestamp: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        656
+      ],
+      "id": "f410d9d5-9a49-4d3f-9414-5bb65819519c",
+      "name": "route_deleted"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.emails_ingest\nSET\n  is_deleted = TRUE,\n  deleted_at = COALESCE($1::timestamptz, NOW()),\n  updated_at = NOW()\nWHERE message_id = $2;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.deletion?.deleted_at || new Date().toISOString(), // $1\n  $json.deletion?.message_id                              // $2\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        624,
+        656
+      ],
+      "id": "5fcbaa80-8643-481c-adee-2948bcf2e35c",
+      "name": "apply_soft_delete",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outlook.process_log (\n  workflow_name, \n  operation, \n  stage, \n  user_upn, \n  message_id,\n  started_at, \n  completed_at, \n  detail, \n  error_message, \n  items_processed, \n  items_failed\n)\nVALUES (\n  'outlook_orchestrator',\n  'unhandled_changetype',\n  'route_by_changetype',\n  $1,  -- user_upn\n  $2,  -- message_id\n  NOW(),\n  NOW(),\n  $3::jsonb,  -- full event\n  $4,  -- changeType value\n  0,\n  1\n);",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.user_upn || null,\n  $json.message_id || null,\n  JSON.stringify($json),\n  'Unhandled changeType: ' + ($json.changeType || 'unknown')\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -208,
+        752
+      ],
+      "id": "427b2488-f512-47dd-a15f-3a4853bcf5bb",
+      "name": "log_unhandled_change",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "bfd64c24-03e7-4aea-ab87-0e00756a990a",
+              "leftValue": "={{$json.query.validationToken || ''}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1040,
+        -64
+      ],
+      "id": "602fe329-533f-4846-be4a-ae81cd51cac7",
+      "name": "is_validation_request"
+    }
+  ],
+  "connections": {
+    "webhook_validate": {
+      "main": [
+        [
+          {
+            "node": "respond_validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "webhook_change": {
+      "main": [
+        [
+          {
+            "node": "is_validation_request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "config_env": {
+      "main": [
+        [
+          {
+            "node": "process_webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "process_webhook": {
+      "main": [
+        [
+          {
+            "node": "filter_errors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "filter_errors": {
+      "main": [
+        [
+          {
+            "node": "log_error",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "normalize_event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "log_error": {
+      "main": [
+        [
+          {
+            "node": "respond_post_success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "normalize_event": {
+      "main": [
+        [
+          {
+            "node": "route_by_changetype",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "route_by_changetype": {
+      "main": [
+        [
+          {
+            "node": "route_created",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "route_updated",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "route_deleted",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "log_unhandled_change",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "route_created": {
+      "main": [
+        [
+          {
+            "node": "ensure_snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "route_updated": {
+      "main": [
+        [
+          {
+            "node": "ensure_snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ensure_snapshot": {
+      "main": [
+        [
+          {
+            "node": "check_need_fetch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_need_fetch": {
+      "main": [
+        [
+          {
+            "node": "get_message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "folder_resolve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_message": {
+      "main": [
+        [
+          {
+            "node": "merge_snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "folder_resolve": {
+      "main": [
+        [
+          {
+            "node": "folders_cache_lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "folders_cache_lookup": {
+      "main": [
+        [
+          {
+            "node": "merge_folder_resolve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "merge_folder_resolve": {
+      "main": [
+        [
+          {
+            "node": "if_cache_hit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "if_cache_hit": {
+      "main": [
+        [
+          {
+            "node": "skip_noop_updates",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "refresh_folder_cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "apply_db_update": {
+      "main": [
+        [
+          {
+            "node": "ensure_restore_status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ensure_restore_status": {
+      "main": [
+        [
+          {
+            "node": "respond_post_success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "refresh_folder_cache": {
+      "main": [
+        [
+          {
+            "node": "merge_folder_from_graph",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "merge_folder_from_graph": {
+      "main": [
+        [
+          {
+            "node": "folders_cache_upsert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "folders_cache_upsert": {
+      "main": [
+        [
+          {
+            "node": "folders_cache_readback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "folders_cache_readback": {
+      "main": [
+        [
+          {
+            "node": "merge_folder_cache_into_event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "merge_folder_cache_into_event": {
+      "main": [
+        [
+          {
+            "node": "apply_db_update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "skip_noop_updates": {
+      "main": [
+        [
+          {
+            "node": "check_skip_update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_skip_update": {
+      "main": [
+        [
+          {
+            "node": "respond_post_success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "apply_db_update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "merge_snapshot": {
+      "main": [
+        [
+          {
+            "node": "folder_resolve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "route_deleted": {
+      "main": [
+        [
+          {
+            "node": "apply_soft_delete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "apply_soft_delete": {
+      "main": [
+        [
+          {
+            "node": "respond_post_success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "log_unhandled_change": {
+      "main": [
+        []
+      ]
+    },
+    "is_validation_request": {
+      "main": [
+        [
+          {
+            "node": "respond_validation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "config_env",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {
+    "webhook_change": [
+      {
+        "headers": {
+          "host": "rxjp.app.n8n.cloud",
+          "content-length": "961",
+          "accept-encoding": "gzip, br",
+          "cdn-loop": "cloudflare; loops=1; subreqs=1",
+          "cf-connecting-ip": "20.190.137.108",
+          "cf-ew-via": "15",
+          "cf-ipcountry": "NL",
+          "cf-ray": "9873bc5f5271fba6-AMS",
+          "cf-visitor": "{\"scheme\":\"https\"}",
+          "cf-worker": "n8n.cloud",
+          "content-type": "application/json; charset=utf-8",
+          "request-id": "add91f6a-9c69-420a-bf84-53f3182241a5",
+          "request-timestamp": "9/30/2025 12:31:11 PM +00:00",
+          "x-forwarded-for": "20.190.137.108, 141.101.76.183",
+          "x-forwarded-host": "rxjp.app.n8n.cloud",
+          "x-forwarded-port": "443",
+          "x-forwarded-proto": "https",
+          "x-forwarded-server": "traefik-prod-users-gwc-17-7798f56955-r25r7",
+          "x-is-trusted": "yes",
+          "x-real-ip": "20.190.137.108"
+        },
+        "params": {},
+        "query": {},
+        "body": {
+          "value": [
+            {
+              "subscriptionId": "28bea976-e4b6-4546-a34b-8818f2de9710",
+              "subscriptionExpirationDateTime": "2025-10-01T10:54:02.964+00:00",
+              "changeType": "updated",
+              "resource": "Users/1386abff-6174-43c9-a62a-34b88bb021a3/Messages/AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARrNymQAAA=",
+              "resourceData": {
+                "@odata.type": "#Microsoft.Graph.Message",
+                "@odata.id": "Users/1386abff-6174-43c9-a62a-34b88bb021a3/Messages/AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARrNymQAAA=",
+                "@odata.etag": "W/\"CQAAABYAAABErAPl96N2RbTL607yO//6AARppVpc\"",
+                "id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARrNymQAAA="
+              },
+              "clientState": "n8n_graph_14O7_7539",
+              "tenantId": "e361cf6f-2864-4bb4-9403-d75fd4ffa70e"
+            }
+          ]
+        },
+        "webhookUrl": "https://rxjp.app.n8n.cloud/webhook/graph/mail",
+        "executionMode": "production"
+      }
+    ]
+  },
+  "meta": {
+    "instanceId": "5bc588890427261aec904f1de6ea2c47f92f0021d7680fbf9bd2043a6f4924b2"
+  }
+}

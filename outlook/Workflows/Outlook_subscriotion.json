@@ -1,0 +1,318 @@
+{
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -5040,
+        -3632
+      ],
+      "id": "30c11825-042f-46c5-8c42-5a4cde008a00",
+      "name": "start",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.microsoft.com/v1.0/subscriptions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"changeType\": \"created,updated\",\n  \"notificationUrl\": \"{{$json.WEBHOOK_PUBLIC_URL}}\",\n  \"resource\": \"users/{{$json.USER_UPN}}/mailFolders('Inbox')/messages\",\n  \"expirationDateTime\": \"{{$now.toUTC().plus({ hours: 23 }).toISO()}}\",\n  \"clientState\": \"{{$json.CLIENT_STATE}}\",\n  \"latestSupportedTlsVersion\": \"v1_2\"\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -4688,
+        -3632
+      ],
+      "id": "08936eac-3fb8-453e-a877-9af6314db617",
+      "name": "create_subscription",
+      "notesInFlow": true,
+      "credentials": {
+        "oAuth2Api": {
+          "id": "wINgbOJ2X4ZzA7NV",
+          "name": "Graph Outlook"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "TENANT_ID",
+              "value": "e361cf6f-2864-4bb4-9403-d75fd4ffa70e"
+            },
+            {
+              "name": "USER_UPN",
+              "value": "jouni.pappila@repoxcapital.fi"
+            },
+            {
+              "name": "WEBHOOK_PUBLIC_URL",
+              "value": "https://rxjp.app.n8n.cloud/webhook/graph/mail"
+            },
+            {
+              "name": "CLIENT_STATE",
+              "value": "n8n_graph_14O7_7539"
+            }
+          ]
+        },
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        -4864,
+        -3632
+      ],
+      "id": "187ed3c2-85b8-4e63-8d90-dc7310f2323b",
+      "name": "Env (placeholders)"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "graph/mail",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -5040,
+        -3376
+      ],
+      "id": "493c757b-1f84-4b3c-83dd-1b6660de85ff",
+      "name": "webhook_outlook",
+      "webhookId": "218b1dc9-03f8-43e3-87f1-58cdc2536474"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c018ba84-79dd-4838-91c5-cb077e6564b5",
+              "leftValue": "={{ $json.query.validationToken }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -4864,
+        -3376
+      ],
+      "id": "d5ca8732-2dca-44e9-abe5-1a43180eac87",
+      "name": "check_validation"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.query.validationToken }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -4672,
+        -3456
+      ],
+      "id": "0ac2d8de-99f5-420e-9a9d-c0a0da1296e2",
+      "name": "return_validation_token"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body || {};\nconst notifications = body.value || [];\n\nif (notifications.length === 0) {\n  return [{json: {message: \"No notifications\"}}];\n}\n\nreturn notifications.map(notif => ({\n  json: {\n    messageId: notif.resourceData?.id || null,\n    changeType: notif.changeType,\n    resource: notif.resource,\n    clientState: notif.clientState,\n    subscriptionId: notif.subscriptionId\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4672,
+        -3296
+      ],
+      "id": "1a7a6423-07a8-4536-95f1-5bf687828893",
+      "name": "parse_notifications"
+    },
+    {
+      "parameters": {
+        "url": "={{ \"https://graph.microsoft.com/v1.0/\" + $json.resource }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$expand",
+              "value": "attachments"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -4512,
+        -3296
+      ],
+      "id": "2d911167-f496-473f-b2ae-155cc1aa71b4",
+      "name": "get_message",
+      "credentials": {
+        "oAuth2Api": {
+          "id": "wINgbOJ2X4ZzA7NV",
+          "name": "Graph Outlook"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "start": {
+      "main": [
+        [
+          {
+            "node": "Env (placeholders)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_subscription": {
+      "main": [
+        []
+      ]
+    },
+    "Env (placeholders)": {
+      "main": [
+        [
+          {
+            "node": "create_subscription",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "webhook_outlook": {
+      "main": [
+        [
+          {
+            "node": "check_validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_validation": {
+      "main": [
+        [
+          {
+            "node": "return_validation_token",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "parse_notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "return_validation_token": {
+      "main": [
+        []
+      ]
+    },
+    "parse_notifications": {
+      "main": [
+        [
+          {
+            "node": "get_message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {
+    "webhook_outlook": [
+      {
+        "headers": {
+          "host": "rxjp.app.n8n.cloud",
+          "content-length": "961",
+          "accept-encoding": "gzip, br",
+          "cdn-loop": "cloudflare; loops=1; subreqs=1",
+          "cf-connecting-ip": "20.190.137.107",
+          "cf-ew-via": "15",
+          "cf-ipcountry": "NL",
+          "cf-ray": "984038de145f9fca-AMS",
+          "cf-visitor": "{\"scheme\":\"https\"}",
+          "cf-worker": "n8n.cloud",
+          "content-type": "application/json; charset=utf-8",
+          "request-id": "f91e2625-2fcf-4a40-864d-48dfd8c25330",
+          "request-timestamp": "9/24/2025 6:28:30 AM +00:00",
+          "x-forwarded-for": "20.190.137.107, 172.71.182.117",
+          "x-forwarded-host": "rxjp.app.n8n.cloud",
+          "x-forwarded-port": "443",
+          "x-forwarded-proto": "https",
+          "x-forwarded-server": "traefik-prod-users-gwc-17-7798f56955-r25r7",
+          "x-is-trusted": "yes",
+          "x-real-ip": "20.190.137.107"
+        },
+        "params": {},
+        "query": {},
+        "body": {
+          "value": [
+            {
+              "subscriptionId": "b4225e9a-1f0e-446a-b488-d310cbe9656a",
+              "subscriptionExpirationDateTime": "2025-09-24T09:42:40.546+00:00",
+              "changeType": "updated",
+              "resource": "Users/1386abff-6174-43c9-a62a-34b88bb021a3/Messages/AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARlxhIIAAA=",
+              "resourceData": {
+                "@odata.type": "#Microsoft.Graph.Message",
+                "@odata.id": "Users/1386abff-6174-43c9-a62a-34b88bb021a3/Messages/AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARlxhIIAAA=",
+                "@odata.etag": "W/\"CQAAABYAAABErAPl96N2RbTL607yO//6AARmW13v\"",
+                "id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAAAAAEMAABErAPl96N2RbTL607yO--6AARlxhIIAAA="
+              },
+              "clientState": "n8n_graph_14O7_7539",
+              "tenantId": "e361cf6f-2864-4bb4-9403-d75fd4ffa70e"
+            }
+          ]
+        },
+        "webhookUrl": "https://rxjp.app.n8n.cloud/webhook/graph/mail",
+        "executionMode": "production"
+      }
+    ]
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "5bc588890427261aec904f1de6ea2c47f92f0021d7680fbf9bd2043a6f4924b2"
+  }
+}

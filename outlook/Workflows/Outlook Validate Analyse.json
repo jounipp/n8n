@@ -1,0 +1,1075 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outlook.email_interest\n  (message_id, model_name, model_version, interest_label, primary_category, interest_sublabel,\n   confidence, priority_score, reasons, rule_conditions, recommended_action,\n   due_at, status, decided_at, requires_deep_analysis)\nSELECT \n  $1, \n  $2, \n  $3, \n  $4, \n  $5, \n  $6,\n  CASE WHEN $7 IS NULL THEN NULL ELSE LEAST(GREATEST($7,0),100) END,\n  CASE WHEN $8 IS NULL THEN NULL ELSE LEAST(GREATEST($8,0),100) END,\n  CASE WHEN $9 IS NULL THEN NULL\n       WHEN $9::text='[]'      THEN ARRAY[]::text[]\n       WHEN jsonb_typeof($9::jsonb)='array' THEN ARRAY(SELECT jsonb_array_elements_text($9::jsonb))\n       ELSE ARRAY[ trim(both '\"' from ($9::jsonb)::text) ] END,\n  $10,\n  $11,\n  NULLIF($12,'')::timestamptz,\n  $13,\n  $14::timestamptz,\n  COALESCE($15, false)\nWHERE EXISTS (\n  SELECT 1 FROM outlook.emails_ingest\n  WHERE message_id = $1\n  AND is_deleted = FALSE\n)\nON CONFLICT (message_id, model_name, model_version) DO UPDATE SET\n  interest_label     = EXCLUDED.interest_label,\n  primary_category   = EXCLUDED.primary_category,\n  interest_sublabel  = EXCLUDED.interest_sublabel,\n  confidence         = EXCLUDED.confidence,\n  priority_score     = EXCLUDED.priority_score,\n  reasons            = EXCLUDED.reasons,\n  rule_conditions    = EXCLUDED.rule_conditions,\n  recommended_action = EXCLUDED.recommended_action,\n  due_at             = EXCLUDED.due_at,\n  status             = EXCLUDED.status,\n  decided_at         = EXCLUDED.decided_at,\n  requires_deep_analysis = EXCLUDED.requires_deep_analysis\nWHERE\n  (email_interest.decided_at IS NULL OR EXCLUDED.decided_at > email_interest.decided_at)\n  AND (email_interest.confidence IS NULL OR EXCLUDED.confidence >= email_interest.confidence)\nRETURNING message_id;",
+        "options": {
+          "queryReplacement": "={{[\n  $json.ei.message_id,\n  $json.ei.model_name,\n  $json.ei.model_version,\n  $json.ei.interest_label,\n  $json.ei.primary_category,\n  $json.ei.interest_sublabel,\n  $json.ei.confidence,\n  $json.ei.priority_score,\n  JSON.stringify($json.ei.reasons ?? []),\n  $json.ei.rule_conditions,\n  $json.ei.recommended_action,\n  $json.ei.due_at_utc,\n  $json.ei.status,\n  $json.ei.decided_at_utc,\n  $json.ei.requires_deep_analysis\n]}}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -48,
+        -944
+      ],
+      "id": "542b6918-011e-4d64-9e25-027d030e4582",
+      "name": "upsert_email_interest",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.emails_ingest\nSET analyzed_at = NOW()\nWHERE message_id = $1;\n",
+        "options": {
+          "queryReplacement": "={{ [ $json.message_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        112,
+        -944
+      ],
+      "id": "5934bf3a-64c2-4d21-aa25-17f7dfab5eee",
+      "name": "mark_analyzed",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalisoi recommended_action vakiojoukkoon.\n// Palauttaa 1→1: { ...ei.recommended_action = one of:\n// 'none','read','review','follow_up','urgent','archive','calendar_consider' }\n\nconst MAP = [\n  { keys: ['archive_after_review','archive'],                    out: 'archive' },\n  { keys: ['review_and_decide','review_when_convenient','read_when_convenient','review_later','optional_review','review'], out: 'review' },\n  { keys: ['follow_up_in_days','follow_up'],                     out: 'follow_up' },\n  { keys: ['calendar_consider','consider_attendance'],           out: 'calendar_consider' },\n  { keys: ['urgent','respond_now'],                              out: 'urgent' },\n  { keys: ['read'],                                              out: 'read' },\n];\n\nfunction norm(x){ return (x ?? '').toString().trim().toLowerCase(); }\nfunction mapAction(a){\n  const s = norm(a);\n  for (const m of MAP) if (m.keys.some(k => s.includes(k))) return m.out;\n  return s || 'none';\n}\n\nreturn items.map(({ json }) => {\n  if (!json?.ei?.message_id) throw new Error('normalize_ei: ei.message_id puuttuu');\n  const ei = { ...json.ei };\n  ei.recommended_action = mapAction(ei.recommended_action);\n  // turvat: rajaa pisteet 0..100 jos tulevat yli/ali\n  if (Number.isFinite(+ei.confidence))      ei.confidence      = Math.min(100, Math.max(0, +ei.confidence));\n  if (Number.isFinite(+ei.priority_score))  ei.priority_score  = Math.min(100, Math.max(0, +ei.priority_score));\n  return { json: { ...json, ei } };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        -976
+      ],
+      "id": "2f76aa21-2001-4665-ac09-e4f3c8a0e0ca",
+      "name": "normalize_ei"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outlook.content_analysis (\n  message_id, language, word_count, sentence_count,\n  topics, ai_tags, persons_mentioned, organizations_mentioned, \n  locations_mentioned, categories_found, external_links, article_links,\n  ai_summary, sentiment_score, business_relevance_score,\n  content_structure, analyzer_version, analyzed_at, analysis_level\n)\nSELECT \n  $1, $2, $3, $4,\n  \n  /* topics */\n  CASE WHEN $5 IS NULL THEN NULL\n       WHEN $5::text='[]'       THEN ARRAY[]::text[]\n       WHEN jsonb_typeof($5::jsonb)='array' THEN ARRAY(SELECT jsonb_array_elements_text($5::jsonb))\n       ELSE ARRAY[ trim(both '\"' from ($5::jsonb)::text) ] END,\n\n  /* ai_tags */\n  CASE WHEN $6 IS NULL THEN NULL\n       WHEN $6::text='[]'       THEN ARRAY[]::text[]\n       WHEN jsonb_typeof($6::jsonb)='array' THEN ARRAY(SELECT jsonb_array_elements_text($6::jsonb))\n       ELSE ARRAY[ trim(both '\"' from ($6::jsonb)::text) ] END,\n\n  /* persons_mentioned */\n  CASE WHEN $7 IS NULL THEN NULL\n       WHEN $7::text='[]'       THEN ARRAY[]::text[]\n       WHEN jsonb_typeof($7::jsonb)='array' THEN ARRAY(SELECT jsonb_array_elements_text($7::jsonb))\n       ELSE ARRAY[ trim(both '\"' from ($7::jsonb)::text) ] END,\n\n  /* organizations_mentioned */\n  CASE WHEN $8 IS NULL THEN NULL\n       WHEN $8::text='[]'       THEN ARRAY[]::text[]\n       WHEN jsonb_typeof($8::jsonb)='array' THEN ARRAY(SELECT jsonb_array_elements_text($8::jsonb))\n       ELSE ARRAY[ trim(both '\"' from ($8::jsonb)::text) ] END,\n\n  /* locations_mentioned */\n  CASE WHEN $9 IS NULL THEN NULL\n       WHEN $9::text='[]'       THEN ARRAY[]::text[]\n       WHEN jsonb_typeof($9::jsonb)='array' THEN ARRAY(SELECT jsonb_array_elements_text($9::jsonb))\n       ELSE ARRAY[ trim(both '\"' from ($9::jsonb)::text) ] END,\n\n  /* categories_found */\n  CASE WHEN $10 IS NULL THEN NULL\n       WHEN $10::text='[]'      THEN ARRAY[]::text[]\n       WHEN jsonb_typeof($10::jsonb)='array' THEN ARRAY(SELECT jsonb_array_elements_text($10::jsonb))\n       ELSE ARRAY[ trim(both '\"' from ($10::jsonb)::text) ] END,\n\n  /* external_links */\n  CASE WHEN $11 IS NULL THEN NULL\n       WHEN $11::text='[]'      THEN ARRAY[]::text[]\n       WHEN jsonb_typeof($11::jsonb)='array' THEN ARRAY(SELECT jsonb_array_elements_text($11::jsonb))\n       ELSE ARRAY[ trim(both '\"' from ($11::jsonb)::text) ] END,\n\n  /* article_links */\n  CASE WHEN $12 IS NULL THEN NULL\n       WHEN $12::text='[]'      THEN ARRAY[]::text[]\n       WHEN jsonb_typeof($12::jsonb)='array' THEN ARRAY(SELECT jsonb_array_elements_text($12::jsonb))\n       ELSE ARRAY[ trim(both '\"' from ($12::jsonb)::text) ] END,\n\n  $13,\n\n  /* sentiment −1..1 */\n  CASE WHEN $14 IS NULL THEN NULL ELSE GREATEST(LEAST($14, 1.0), -1.0) END,\n\n  /* relevance 0..100 → 0..9.99 (numeric(3,2)) */\n  CASE WHEN $15 IS NULL THEN NULL ELSE LEAST(GREATEST($15, 0), 100) / 100.0 END,\n\n  /* content_structure */\n  $16::jsonb,\n\n  $17, $18::timestamptz, $19\n\nWHERE EXISTS (\n  SELECT 1 FROM outlook.emails_ingest \n  WHERE message_id = $1 \n  AND is_deleted = FALSE\n)\n\nON CONFLICT (message_id) DO UPDATE SET\n  language                 = EXCLUDED.language,\n  word_count               = EXCLUDED.word_count,\n  sentence_count           = EXCLUDED.sentence_count,\n  topics                   = EXCLUDED.topics,\n  ai_tags                  = EXCLUDED.ai_tags,\n  persons_mentioned        = EXCLUDED.persons_mentioned,\n  organizations_mentioned  = EXCLUDED.organizations_mentioned,\n  locations_mentioned      = EXCLUDED.locations_mentioned,\n  categories_found         = EXCLUDED.categories_found,\n  external_links           = EXCLUDED.external_links,\n  article_links            = EXCLUDED.article_links,\n  ai_summary               = EXCLUDED.ai_summary,\n  sentiment_score          = EXCLUDED.sentiment_score,\n  business_relevance_score = EXCLUDED.business_relevance_score,\n  content_structure        = EXCLUDED.content_structure,\n  analyzer_version         = EXCLUDED.analyzer_version,\n  analyzed_at              = EXCLUDED.analyzed_at,\n  analysis_level           = EXCLUDED.analysis_level\nWHERE\n  (content_analysis.analysis_level IS DISTINCT FROM 'deep' OR EXCLUDED.analysis_level = 'deep')\n  AND (content_analysis.analyzed_at IS NULL OR EXCLUDED.analyzed_at > content_analysis.analyzed_at);",
+        "options": {
+          "queryReplacement": "={{[\n  $json.ca.message_id,\n  $json.ca.language,\n  $json.ca.word_count,\n  $json.ca.sentence_count,\n  JSON.stringify($json.ca.topics ?? null),\n  JSON.stringify($json.ca.ai_tags ?? null),\n  JSON.stringify($json.ca.persons_mentioned ?? null),\n  JSON.stringify($json.ca.organizations_mentioned ?? null),\n  JSON.stringify($json.ca.locations_mentioned ?? null),\n  JSON.stringify($json.ca.categories_found ?? null),\n  JSON.stringify($json.ca.external_links ?? null),\n  JSON.stringify($json.ca.article_links ?? null),\n  $json.ca.ai_summary,\n  $json.ca.sentiment_score,\n  $json.ca.business_relevance_score,\n  JSON.stringify($json.ca.content_structure ?? null),\n  $json.ca.analyzer_version,\n  $json.ca.analyzed_at_utc,\n  $json.ca.analysis_level\n]}}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -64,
+        -1296
+      ],
+      "id": "5c3ac588-5c1d-4414-acce-0f95092778d1",
+      "name": "upsert_content_analysis",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO outlook.ai_analysis_log\n    (message_id, analyzer_version, analyzed_at, model_name, model_version, raw_analysis)\n  SELECT\n    $1, $2, $3::timestamptz, $4, $5, $6::jsonb\n  WHERE EXISTS (\n    SELECT 1 FROM outlook.emails_ingest e WHERE e.message_id = $1\n  )\n  RETURNING 1\n)\nSELECT COALESCE((SELECT 1 FROM ins), 0) AS inserted;\n",
+        "options": {
+          "queryReplacement": "={{[\n  $json.log.message_id,\n  $json.log.analyzer_version,\n  $json.log.analyzed_at,\n  $json.log.model_name,\n  $json.log.model_version,\n  $json.log.raw_analysis\n]}}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -48,
+        -1120
+      ],
+      "id": "ade42ac7-a74f-44cd-aac1-e9c1034631a8",
+      "name": "insert_ai_analysis_log",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outlook.emails_ingest\nSET\n  auto_processed = false,\n  updated_at = NOW(),\n  notes = CASE\n            WHEN notes IS NULL OR notes = '' THEN CONCAT('validate_error: ', NOW()::text, ' | ', $2)\n            ELSE CONCAT(notes, ' | validate_error: ', NOW()::text, ' | ', $2)\n          END\nWHERE message_id = $1;\n",
+        "options": {
+          "queryReplacement": "={{ [ $json.message_id, $json.err ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -512,
+        -992
+      ],
+      "id": "7d5987c7-44ba-41b6-b9bc-42c472fcc269",
+      "name": "mark_error",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Yhtenäistää virhekirjauksen parametrit mark_errorille.\n// Hakee message_id:n eri haaroista ja tiivistää virheviestin.\n\nfunction pickMessageId(j){\n  return j?.ca?.message_id\n      || j?.ei?.message_id\n      || j?.message_id\n      || j?.id_for_join\n      || j?.graph_id\n      || j?.internet_message_id\n      || null;\n}\n\nreturn items.map((item) => {\n  const j = item.json || {};\n  const mid = pickMessageId(j);\n  if (!mid) throw new Error('prepare_error_params: message_id puuttuu virhehaarassa');\n\n  // n8n error-branch: $json ja $error ovat käytettävissä\n  const emsg = (item?.error?.message || item?.json?.error || 'unknown_error').toString();\n  const eshort = emsg.length > 500 ? emsg.slice(0, 500) : emsg;\n\n  return { json: { message_id: mid, err: eshort } };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -720,
+        -1024
+      ],
+      "id": "dd9d16f9-f6cc-4167-bd6b-ae0870798601",
+      "name": "prepare_error_params"
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "6e8c16f2-096c-4bdc-ae88-b014cd0834ae",
+      "typeVersion": 1.1,
+      "name": "Start",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "position": [
+        -1376,
+        -1872
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// build_batch_prompt_cache — HYBRID VERSION\n\nfunction sanitizeText(s) {\n  if (s == null) return '';\n  let t = String(s);\n  t = t.replace(/\\uFEFF/g, '');\n  t = t.replace(/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F]/g, '');\n  return t.trim();\n}\n\nfunction pickMinimalInputFields(x) {\n  return {\n    message_id: x.message_id,\n    subject: sanitizeText(x.subject),\n    from: x.from_address || x.from_domain || '',\n    text: sanitizeText(x.body_text || '')\n  };\n}\n\n// Hae data edellisestä nodesta (merge_rules_to_batch)\nconst inputData = items[0].json;\n\n// Debug\nconsole.log('Input keys:', Object.keys(inputData));\nconsole.log('batch_items exists?', !!inputData.batch_items);\n\n// Poimi kentät\nconst batchItems = inputData.batch_items || [];\nconst batchSize = inputData.batch_size || batchItems.length;\nconst batchNumber = inputData.batch_number || 1;\nconst rulesVersion = inputData.rules_version || 'default_v1';\nconst rulesDsl = inputData.rules_dsl || '';\nconst rulesCount = inputData.rules_count || 0;\n\nif (batchItems.length === 0) {\n  console.error('ERROR: No batch_items to process!');\n  return [{ json: { error: 'No batch_items' } }];\n}\n\nconst message_count = batchItems.length;\nconst inputItems = batchItems.map(pickMinimalInputFields);\nconst batch_prompt = JSON.stringify(inputItems, null, 2);\n\n// ========== SYSTEM PROMPT WITH RULES ==========\nlet system_prompt_base = `Olet rahoituskäyttöön koulutettu sähköpostiluokittelun asiantuntija.\n\nRULES VERSION: ${rulesVersion}\nRULES COUNT: ${rulesCount}`;\n\nlet rules_section = '';\nif (rulesCount > 0 && rulesDsl) {\n  rules_section = `\n\n═══════════════════════════════════════════════\nTUNNETUT LÄHETTÄJÄT JA SÄÄNNÖT (${rulesVersion})\n═══════════════════════════════════════════════\n\nKäytä näitä tunnettuja sääntöjä apuna luokittelussa:\n\n${rulesDsl}\n\nHUOM: Nämä säännöt perustuvat ${rulesCount} tunnettuun lähettäjään.\n═══════════════════════════════════════════════\n`;\n}\n\nconst system_prompt_categories = `\n\nPRIMARY_CATEGORY LUOKITTELU (PAKOLLINEN):\n\n1. business_critical\n2. personal_communication\n3. financial_news\n4. marketing\n5. notifications\n6. industry_news\n7. internal\n8. regulatory\n9. spam_low_value\n10. uncategorized\n\n[... lisää kategoriamäärittelyt tähän ...]`;\n\nconst system_prompt = system_prompt_base + rules_section + system_prompt_categories;\n\nconst user_prompt = `Analysoi seuraavat ${message_count} sähköpostia ja palauta JSON-taulukko:\\n\\n${batch_prompt}`;\n\n// Cache-muodossa\nconst system = [\n  {\n    type: \"text\",\n    text: system_prompt,\n    cache_control: { type: \"ephemeral\" }\n  }\n];\n\nconst messages = [\n  {\n    role: 'user',\n    content: user_prompt\n  }\n];\n\nreturn [{\n  json: {\n    batch_items: batchItems,\n    batch_size: batchSize,\n    batch_number: batchNumber,\n    message_count,\n    system,\n    messages,\n    rules_version: rulesVersion,\n    rules_count: rulesCount,\n    system_prompt,  // Debug\n    user_prompt,    // Debug\n    batch_prompt\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        -1584
+      ],
+      "id": "975d2550-bcae-4cfa-87d0-1e7a62ccf942",
+      "name": "build_batch_prompt_cache"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "anthropic-beta",
+              "value": "prompt-caching-2024-07-31"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n     \"model\": \"claude-sonnet-4-5-20250929\",\n     \"max_tokens\": 30000,\n     \"system\": $json.system,\n     \"messages\": $json.messages\n   } }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -848,
+        -1360
+      ],
+      "id": "b482eb90-7baa-408e-9e01-3e086a564168",
+      "name": "ai_classify_emails_cache",
+      "notesInFlow": true,
+      "credentials": {
+        "anthropicApi": {
+          "id": "XlrgzrywMY0KCmRC",
+          "name": "Anthropic account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Loop over input items and add a new field called 'myNewField' to the JSON of each one\nfor (const item of $input.all()) {\n  item.json.myNewField = 1;\n}\n\nreturn $input.all();"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -688,
+        -1376
+      ],
+      "id": "d64eb73c-1c40-4874-9b64-13af8daeba56",
+      "name": "parse_ai_response",
+      "notesInFlow": true,
+      "notes": "CACHE vain"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Loop over input items and add a new field called 'myNewField' to the JSON of each one\nfor (const item of $input.all()) {\n  item.json.myNewField = 1;\n}\n\nreturn $input.all();"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -720,
+        -1184
+      ],
+      "id": "996db585-8f4d-46cb-aaf6-504d83242560",
+      "name": "parse_ai_response1",
+      "notesInFlow": true,
+      "notes": "CACHE vain"
+    },
+    {
+      "parameters": {
+        "jsCode": "// parse_ai_json — n8n Code (JavaScript)\n// Parses AI response with robust error handling\n\n// ========== HELPER FUNCTIONS ==========\n\nfunction cleanInput(text) {\n  return text\n    .replace(/^\\uFEFF/, '')\n    .replace(/[\\u200B-\\u200D\\uFEFF\\u034F\\u2060]/g, '')\n    .replace(/```json\\s*/gi, '')\n    .replace(/```\\s*/g, '')\n    .replace(/…/g, '...')\n    .trim();\n}\n\nfunction findLongestValidArray(text) {\n  const candidates = [];\n  \n  for (let start = 0; start < text.length; start++) {\n    if (text[start] !== '[') continue;\n    \n    for (let end = start + 1; end < text.length; end++) {\n      if (text[end] !== ']') continue;\n      \n      const slice = text.slice(start, end + 1);\n      try {\n        const parsed = JSON.parse(slice);\n        // KRIITTINEN: Hyväksy VAIN taulukot joissa on OBJEKTEJA\n        if (Array.isArray(parsed) && \n            parsed.length > 0 && \n            typeof parsed[0] === 'object' && \n            parsed[0] !== null &&\n            !Array.isArray(parsed[0])) {\n          candidates.push({ parsed, length: parsed.length, size: slice.length });\n        }\n      } catch {}\n    }\n  }\n  \n  if (candidates.length === 0) return null;\n  // Järjestä SIZE mukaan (pisin JSON), ei length mukaan\n  candidates.sort((a, b) => b.size - a.size);\n  return candidates[0].parsed;\n}\n\nfunction getAiText(json) {\n  if (!json) return null;\n  if (json.content && Array.isArray(json.content) && json.content[0]?.text) {\n    return json.content[0].text;\n  }\n  if (typeof json === 'string') return json;\n  if (json.text) return json.text;\n  return null;\n}\n\nfunction createErrorPlaceholder(message_id, errorMsg) {\n  return {\n    message_id: message_id || 'unknown',\n    _error: errorMsg,\n    id: 0,\n    classification: {\n      category: 'uncategorized',\n      primary_category: 'uncategorized',\n      suggested_new_category: null,\n      confidence: 0,\n      is_known_pattern: false,\n      suggested_rule: null\n    },\n    pattern_discovery: {\n      domain_pattern: null,\n      subject_pattern: null,\n      content_indicators: []\n    },\n    priority_assessment: {\n      priority: 0,\n      requires_attention: false,\n      action_needed: 'none',\n      due_at_utc: null\n    },\n    entities: {\n      companies: [],\n      metrics: [],\n      dates: []\n    },\n    recommendation: {\n      category_action: 'use_existing',\n      proposed_rule: null\n    },\n    content_analysis: {\n      language: null,\n      word_count: 0,\n      sentence_count: 0,\n      topics: [],\n      ai_summary: errorMsg,\n      ai_tags: [],\n      sentiment_score: 0,\n      business_relevance_score: 0,\n      external_links: [],\n      article_links: [],\n      categories_found: [],\n      content_structure: {\n        content_location: 'mixed',\n        has_substantial_text: false,\n        primary_content_type: 'brief_summary',\n        actionable_content: false\n      },\n      analyzer_version: 'claude-sonnet-4-5-20250929',\n      analyzed_at_utc: new Date().toISOString()\n    },\n    decision: {\n      model_name: 'claude',\n      model_version: 'claude-sonnet-4-5-20250929',\n      interest_label: 'uncategorized',\n      interest_sublabel: null,\n      confidence: 0,\n      priority_score: 0,\n      reasons: [errorMsg],\n      rule_conditions: null,\n      recommended_action: 'none',\n      due_at_utc: null,\n      status: 'proposed',\n      decided_at_utc: new Date().toISOString()\n    },\n    analysis_level: 'signal'\n  };\n}\n\n// ========== MAIN ==========\n\nconst aiOutput = $('ai_classify_emails_cache').first().json;\nconst batchData = $('build_batch_prompt_cache').first().json;  // ← KORJATTU!\nconst batchItems = batchData.batch_items || [];\nconst expected = batchData.message_count || batchData.batch_size || batchItems.length;\n\nif (batchItems.length === 0) {\n  return [{ json: createErrorPlaceholder(null, 'Ei viestejä käsiteltäväksi') }];\n}\n\nconst rawIn = getAiText(aiOutput);\n\nif (!rawIn) {\n  return batchItems.map(item => ({\n    json: createErrorPlaceholder(item.message_id, 'AI ei palauttanut tekstiä')\n  }));\n}\n\nconst cleaned = cleanInput(rawIn);\nconst arr = findLongestValidArray(cleaned);\n\nif (!arr) {\n  return batchItems.map(item => ({\n    json: createErrorPlaceholder(item.message_id, 'JSON parsinta epäonnistui')\n  }));\n}\n\nif (!Array.isArray(arr)) {\n  return batchItems.map(item => ({\n    json: createErrorPlaceholder(item.message_id, 'AI palautti ei-taulukon')\n  }));\n}\n\nif (arr.length < expected) {\n  const receivedIds = new Set(arr.map(x => x?.message_id).filter(Boolean));\n  \n  batchItems.forEach(item => {\n    if (!receivedIds.has(item.message_id)) {\n      arr.push(createErrorPlaceholder(item.message_id, 'AI ei palauttanut'));\n    }\n  });\n}\n\nreturn arr.map((obj, idx) => {\n  if (!obj || typeof obj !== 'object') {\n    const mid = batchItems[idx]?.message_id || `unknown_${idx}`;\n    return { json: createErrorPlaceholder(mid, 'AI palautti virheellisen objektin') };\n  }\n  \n  if (!obj.message_id) {\n    obj.message_id = batchItems[idx]?.message_id || `unknown_${idx}`;\n  }\n  \n  return { json: obj };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -496,
+        -1200
+      ],
+      "id": "3c2afc7a-86ed-4a8c-9dc1-3c1460d0c899",
+      "name": "parse_ai_json_cache"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outlook.process_log (\n  workflow_name,\n  operation,\n  stage,\n  batch_size,\n  started_at,\n  completed_at,\n  detail,\n  items_processed,\n  api_calls_made,\n  created_at\n)\nVALUES (\n  'delta_validate',\n  'ai_classify',\n  'usage_tracking',\n  $1,  -- batch_size (montako viestiä)\n  $2::timestamptz,  -- timestamp\n  $2::timestamptz,\n  $3::jsonb,  -- usage metadata\n  $1,\n  1,  -- yksi AI-kutsu\n  NOW()\n);",
+        "options": {
+          "queryReplacement": "={{ [\n  $json._batch_size,\n  $json._usage_metadata.timestamp,\n  JSON.stringify($json._usage_metadata)\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -336,
+        -1376
+      ],
+      "id": "e645325b-afdb-4acd-aa40-604b477f0a29",
+      "name": "log_ai_usage_cache",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// build_log_ai — KORJATTU versio\nreturn items.map(({ json }) => {\n  if (!json.message_id) {\n    throw new Error('build_log_ai: message_id puuttuu inputista');\n  }\n  \n  if (!json.content_analysis) {\n    throw new Error('build_log_ai: content_analysis puuttuu inputista');\n  }\n  \n  if (!json.decision) {\n    throw new Error('build_log_ai: decision puuttuu inputista');\n  }\n  \n  const now = new Date().toISOString();  // ← LISÄTTY: yhteinen timestamp\n  \n  // Rakenna content_analysis (ca)\n  const ca = {\n    message_id: json.message_id,\n    ...json.content_analysis,\n    analyzed_at_utc: now,  // ← LISÄTTY!\n    analysis_level: json.analysis_level || 'signal'\n  };\n  \n  // Rakenna email_interest (ei) decision-osiosta\n  const ei = {\n    message_id: json.message_id,\n    model_name: json.decision.model_name || 'claude',\n    model_version: json.decision.model_version || 'claude-sonnet-4-5-20250929',\n    interest_label: json.decision.interest_label || json.classification.primary_category,\n    primary_category: json.classification.primary_category,\n    interest_sublabel: json.decision.interest_sublabel || null,\n    confidence: json.decision.confidence || json.classification.confidence || 0,\n    priority_score: json.decision.priority_score || json.priority_assessment.priority || 0,\n    reasons: json.decision.reasons || [],\n    rule_conditions: json.decision.rule_conditions || json.classification.suggested_rule || null,\n    recommended_action: json.decision.recommended_action || json.priority_assessment.action_needed || 'none',\n    due_at_utc: json.decision.due_at_utc || json.priority_assessment.due_at_utc || null,\n    status: json.decision.status || 'proposed',\n    decided_at_utc: now,  // ← KORJATTU: käytä samaa timestampia\n    requires_deep_analysis: json.decision.requires_deep_analysis || false\n  };\n  \n  // Rakenna audit log\n  const log = {\n    message_id: json.message_id,\n    analyzer_version: ca.analyzer_version || 'claude-sonnet-4-5-20250929',\n    analyzed_at: now,  // ← KORJATTU: käytä samaa timestampia\n    model_name: ei.model_name,\n    model_version: ei.model_version,\n    raw_analysis: json\n  };\n  \n  return { json: { log, ca, ei } };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        -1200
+      ],
+      "id": "bf202183-223c-4f45-bc51-8f6cf0f0fcc7",
+      "name": "build_log_ai_cache"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Hae voimassa oleva snapshot TAI palauta tyhjä default-rivi\nWITH s AS (\n  SELECT \n    version, \n    rules_json, \n    rules_dsl, \n    expires_at, \n    is_active, \n    rules_count, \n    created_at\n  FROM outlook.rules_snapshot\n  WHERE is_active = TRUE \n    AND expires_at > NOW()\n  ORDER BY created_at DESC\n  LIMIT 1\n)\nSELECT * FROM s\nUNION ALL\nSELECT\n  NULL::text AS version,\n  '[]'::jsonb AS rules_json,\n  ''::text AS rules_dsl,\n  NOW() AS expires_at,\n  FALSE AS is_active,\n  0 AS rules_count,\n  NOW() AS created_at\nWHERE NOT EXISTS (SELECT 1 FROM s);",
+        "options": {}
+      },
+      "id": "fdcb1e90-c0ae-4d75-8fa7-b1ff27e19dac",
+      "name": "get_rules_snapshot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -1200,
+        -1696
+      ],
+      "notesInFlow": true,
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Hae aktiiviset säännöt JA niiden uusimmat metriikat\nSELECT \n  r.id,\n  r.version,\n  r.feature,\n  r.key_value,\n  r.target_category,\n  r.priority,\n  r.recommended_action,\n  r.scope,\n  r.rule_type,\n  COALESCE(m.support, 0) AS support,\n  COALESCE(m.precision_cat_pct, 0) AS precision_cat_pct,\n  COALESCE(m.avg_relevance_pct, 0) AS avg_relevance_pct\nFROM outlook.classification_rules r\nLEFT JOIN LATERAL (\n  SELECT \n    support, \n    precision_cat_pct, \n    avg_relevance_pct\n  FROM outlook.classification_rule_metrics\n  WHERE rule_id = r.id\n  ORDER BY measured_at DESC\n  LIMIT 1\n) m ON TRUE\nWHERE r.is_active = TRUE\nORDER BY r.priority ASC, COALESCE(m.support, 0) DESC;",
+        "options": {}
+      },
+      "id": "a31d39f4-de6b-435e-9ead-e7fe7e922c8b",
+      "name": "load_classification_rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -864,
+        -1600
+      ],
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Invalidoi vanhat ja tallenna uusi snapshot\nWITH invalidated AS (\n  UPDATE outlook.rules_snapshot\n  SET is_active = FALSE\n  WHERE is_active = TRUE\n  RETURNING version AS old_version\n),\ninserted AS (\n  INSERT INTO outlook.rules_snapshot (\n    version,\n    rules_json,\n    rules_dsl,\n    expires_at,\n    rules_count,\n    total_support,\n    avg_precision,\n    is_active,\n    ttl_hours\n  )\n  VALUES (\n    '{{ $json.version }}',\n    '{{ $json.rules_json }}'::jsonb,\n    '{{ $json.rules_dsl }}',\n    '{{ $json.expires_at }}'::timestamptz,\n    {{ $json.rules_count }},\n    {{ $json.total_support }},\n    {{ $json.avg_precision }},\n    TRUE,\n    24\n  )\n  RETURNING \n    version, \n    created_at, \n    expires_at, \n    rules_count,\n    total_support,\n    avg_precision\n)\nSELECT \n  i.*,\n  (SELECT COUNT(*) FROM invalidated) AS invalidated_count\nFROM inserted i;",
+        "options": {
+          "queryBatching": "all"
+        }
+      },
+      "id": "a6e0b4b4-2ba7-4c2e-aba6-2609385a5a9a",
+      "name": "save_rules_snapshot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -688,
+        -1744
+      ],
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "429737d9-5fca-4a3a-be62-320a8fcf1d96",
+              "leftValue": "={{ $json.version }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "60dcba12-2005-411f-ad89-fba765c1afcf",
+              "leftValue": "={{ new Date($json.expires_at).getTime() > Date.now() }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1040,
+        -1696
+      ],
+      "id": "bdebb1dc-3d8c-45b7-af1d-42ac7e8e5027",
+      "name": "check_cache_valid"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Rakentaa DSL-tekstin classification_rules riveistä\n\nconst rules = items.map(i => i.json);\n\nif (rules.length === 0) {\n  return [{\n    json: {\n      version: 'default_v1',\n      rules_json: [],\n      rules_dsl: '',\n      expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),\n      rules_count: 0,\n      total_support: 0,\n      avg_precision: 0\n    }\n  }];\n}\n\n// Järjestä prioriteetin ja tuen mukaan\nrules.sort((a, b) => {\n  if (a.priority !== b.priority) return a.priority - b.priority;\n  return (b.support || 0) - (a.support || 0);\n});\n\n// Ryhmittele kategorioittain\nconst rulesByCategory = {};\nrules.forEach(r => {\n  if (!rulesByCategory[r.target_category]) {\n    rulesByCategory[r.target_category] = [];\n  }\n  \n  const precision = r.precision_cat_pct || 0;\n  const confidence = precision >= 95 ? 'KORKEA' :\n                     precision >= 80 ? 'HYVÄ' : \n                     precision >= 60 ? 'KOHTALAINEN' : 'MATALA';\n  \n  rulesByCategory[r.target_category].push({\n    feature: r.feature,\n    value: r.key_value,\n    support: r.support || 0,\n    precision: confidence,\n    action: r.recommended_action || 'review'\n  });\n});\n\n// Luo DSL-teksti\nconst dslLines = [];\nfor (const [category, categoryRules] of Object.entries(rulesByCategory)) {\n  dslLines.push(`\\n=== ${category.toUpperCase()} ===`);\n  categoryRules.forEach(r => {\n    const supportText = r.support > 0 ? `${r.support} osumaa` : 'ei dataa';\n    dslLines.push(`- JOS ${r.feature}=\"${r.value}\" → ${category} (${r.precision} tarkkuus, ${supportText}, toimenpide: ${r.action})`);\n  });\n}\n\nconst dsl = dslLines.join('\\n');\nconst version = `hybrid_${new Date().toISOString().split('T')[0]}_r${rules.length}`;\nconst ttlHours = 24;\nconst expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000).toISOString();\n\nconst totalSupport = rules.reduce((sum, r) => sum + (r.support || 0), 0);\nconst avgPrecision = rules.length > 0 \n  ? rules.reduce((sum, r) => sum + (r.precision_cat_pct || 0), 0) / rules.length\n  : 0;\n\nreturn [{\n  json: {\n    version: version,\n    rules_json: rules,\n    rules_dsl: dsl,\n    expires_at: expiresAt,\n    rules_count: rules.length,\n    total_support: totalSupport,\n    avg_precision: Math.round(avgPrecision * 100) / 100\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -688,
+        -1600
+      ],
+      "id": "6296d4c7-5a46-4490-8ecb-bc955449421a",
+      "name": "build_rules_dsl"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Yhdistää rules_snapshot datan batch_items dataan\n// HUOM: Tämä node tarvitsee KAKSI inputtia!\n\n// Input 0: Alkuperäinen batch data Start-nodesta\n// Input 1: Rules data (cache hit TAI cache miss)\n\nconst inputs = $input.all();\n\n// Debug: montako inputtia saadaan\nif (!inputs || inputs.length === 0) {\n  return [{\n    json: {\n      error: 'No inputs received',\n      batch_items: [],\n      rules_version: 'error_no_input'\n    }\n  }];\n}\n\n// Etsi batch data ja rules data\nlet batchData = null;\nlet rulesData = null;\n\n// Käy läpi kaikki inputit\ninputs.forEach(item => {\n  const data = item.json;\n  \n  // Jos löytyy batch_items, se on batch data\n  if (data.batch_items && Array.isArray(data.batch_items)) {\n    batchData = data;\n  }\n  \n  // Jos löytyy rules_version tai version, se on rules data  \n  if (data.rules_version || data.version) {\n    rulesData = data;\n  }\n});\n\n// Jos batch data puuttuu, yritä hakea Start nodesta\nif (!batchData) {\n  try {\n    const startNode = $('Start').first();\n    if (startNode && startNode.json) {\n      batchData = startNode.json;\n    }\n  } catch (e) {\n    // Start node ei saatavilla\n  }\n}\n\n// Fallback: jos ei batch dataa\nif (!batchData || !batchData.batch_items) {\n  batchData = {\n    batch_items: [],\n    batch_size: 0,\n    batch_number: 1\n  };\n}\n\n// Fallback: jos ei rules dataa\nif (!rulesData) {\n  rulesData = {\n    version: 'default_v1',\n    rules_json: [],\n    rules_dsl: '',\n    rules_count: 0\n  };\n}\n\n// Yhdistä data\nconst merged = {\n  // Batch kentät\n  batch_items: batchData.batch_items || [],\n  batch_size: batchData.batch_size || 0,\n  batch_number: batchData.batch_number || 1,\n  \n  // Rules kentät\n  rules_version: rulesData.version || rulesData.rules_version || 'default_v1',\n  rules_dsl: rulesData.rules_dsl || '',\n  rules_count: rulesData.rules_count || 0,\n  rules_json: rulesData.rules_json || [],\n  rules_from_cache: (rulesData.version && rulesData.version !== 'default_v1')\n};\n\nreturn [{ json: merged }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -416,
+        -1872
+      ],
+      "id": "93b21f8a-b9df-42ea-ae8a-fea4202b7246",
+      "name": "merge_rules_to_batch"
+    }
+  ],
+  "connections": {
+    "upsert_email_interest": {
+      "main": [
+        [
+          {
+            "node": "mark_analyzed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "mark_analyzed": {
+      "main": [
+        []
+      ]
+    },
+    "normalize_ei": {
+      "main": [
+        [
+          {
+            "node": "upsert_email_interest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "insert_ai_analysis_log": {
+      "main": [
+        []
+      ]
+    },
+    "prepare_error_params": {
+      "main": [
+        [
+          {
+            "node": "mark_error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "get_rules_snapshot",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "merge_rules_to_batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "build_batch_prompt_cache": {
+      "main": [
+        [
+          {
+            "node": "ai_classify_emails_cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ai_classify_emails_cache": {
+      "main": [
+        [
+          {
+            "node": "parse_ai_response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "parse_ai_response1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "parse_ai_response": {
+      "main": [
+        [
+          {
+            "node": "parse_ai_json_cache",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "log_ai_usage_cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "parse_ai_response1": {
+      "main": [
+        [
+          {
+            "node": "prepare_error_params",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "parse_ai_json_cache": {
+      "main": [
+        [
+          {
+            "node": "build_log_ai_cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "build_log_ai_cache": {
+      "main": [
+        [
+          {
+            "node": "insert_ai_analysis_log",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "upsert_content_analysis",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "normalize_ei",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_rules_snapshot": {
+      "main": [
+        [
+          {
+            "node": "check_cache_valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "load_classification_rules": {
+      "main": [
+        [
+          {
+            "node": "build_rules_dsl",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "save_rules_snapshot": {
+      "main": [
+        [
+          {
+            "node": "merge_rules_to_batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_cache_valid": {
+      "main": [
+        [
+          {
+            "node": "merge_rules_to_batch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "load_classification_rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "build_rules_dsl": {
+      "main": [
+        [
+          {
+            "node": "save_rules_snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "merge_rules_to_batch": {
+      "main": [
+        [
+          {
+            "node": "build_batch_prompt_cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {
+    "Start": [
+      {
+        "user_upn": "jouni.pappila@repoxcapital.fi",
+        "batch_items": [
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOfoW1RAABErAPl96N2RbTL607yO--6AAQ0MKEQAAA=",
+            "internet_message_id": "<22.9E.37553.4FC3C686@i-0881c8ce7686e5f33.mta1vrest.sd.prd.sparkpost>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOfoW1RAAA=",
+            "subject": "Tariffs, again",
+            "from_domain": "news.bloomberg.com",
+            "from_address": "noreply@news.bloomberg.com",
+            "body_preview": "Evening Briefing Americas\r\nView in browser\r\n\r\n\r\n\r\n\r\n\r\nUS President Donald Trump has unveiled letters that threaten to impose higher tariff rates on key trading partners, including levies of 25% on goods from Japan and South Korea beginning Aug. 1.\r\n\r\nTrum",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 68411,
+            "received_datetime": "2025-07-07T21:32:55.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:14.844Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "To get John Authers’ newsletter delivered directly to your inbox, sign up here. Rather than TACO Tuesday, we now need to wait until Aug. 1 f\nView in browser\n[Bloomberg]\n[https://sli.bloomberg.com/imp?s=1149014&li=14140604&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07082025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=static]\n[https://sli.bloomberg.com/imp?s=1149014&li=14140604&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07082025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=desktop&collapse_width=550]\n[https://sli.bloomberg.com/imp?s=1149014&li=14140604&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07082025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=mobile&collapse_width=550]\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/ifhfLGNiEMF8/v0/-1x-1.png]\n\nTo get John Authers’ newsletter delivered directly to your inbox, sign up here.\n\nToday’s Points:\n\n* Rather than TACO Tuesday, we now need to wait until Aug. 1 for tariff decisions.\n* Levies on Japan and South Korea will resume at 25%; others have small reductions.\n* The EU doesn’t have a letter yet — and is the focus of the greatest uncertainty.\n* Oil rose despite OPEC supply hikes, and alternative energy is surviving Trump’s beautiful law.\n* AND: Like the president, time to sit down and write a letter.\n\nTACOs in Three Weeks?\n\nTACO Tuesday may never come. The conclusion of the three-month pause in the swingeing “reciprocal” tariffs announced on April 2 may not see the expected fireworks after a (not-so) Manic Monday, in which the US kicked the can down the road until Aug. 1. Tariffs are unchanged until then. A Freaky Friday, in the middle of the summer doldrums, awaits.\n\nLetters to different countries revealing the proposed tariff rates on their goods that would apply from the end of this month seeped out throughout the day. Most were unchanged from the steep rates announced on Liberation Day, while some were reduced a little. They can still raise eyebrows. Levies of 25% on Japan, South Korea, and Malaysia would, if sustained, surely depress global trade and growth. In all cases the letters, apparently written by the president himself, included a threat to match any retaliatory tariffs, and a hope of reaching a deal this month.\n\nIt’s hard to call this an escalation. Nor is it the full-fledged retreat that some had predicted. That’s partly because events in the last three months have strengthened the chances that tariffs stay in force. Since Liberation Day:\n\nThe Dollar Fell\n\nThe logic of tariffs is that exchange rates adjust to accommodate them. If levies make US goods more competitive, the dollar should rise to compensate. But the dollar entered the year overvalued, many managers decided to hedge their US exposures, and the currency fell. That boosted US competitiveness:\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i1pOEHvabq0c/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nAs a weaker dollar is an administration aim, this will be taken as a success. It’s harder to tell the president to desist.\n\nNobody But China Retaliated; and Nobody Made a Serious Deal\n\nAside from China, nobody raised tariffs in response (the EU had some levies ready to go when the pause was announced). That reduced the overall chilling effect on global trade. But there were almost no deals, with the exceptions of the UK (as close an ally as the US has, with which it has a trade surplus) and Vietnam. Neither had a lot of detail, or much in the way of concrete concessions. Deals are hard because most countries don’t have high tariffs in the first place, while “non-tariff barriers” (like value-added taxes or alleged currency manipulation) are difficult to move. According to Seth Carpenter of Morgan Stanley:\n\nHistorically, fully fledged trade deals take, on average, three years to conclude, not three months. While history has not been a blueprint for how this year has gone, we still think the lessons are critical, and intense negotiations surround each product category.\n\nIn other words, there’s little to no chance that the uncertainty is resolved soon. And there never was much hope of that.\n\nTariffs Haven’t (Yet) Made a Big Impact on Inflation or Jobs\n\nJune inflation won’t be available until next week. For the first two months since the Liberation Day 10% baseline took effect, however, signs of tariffs driving price increases were minimal.\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iwAbhMQ1EzOY/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nUnemployment for June, published last week, similarly showed no significant impact from tariffs. It was possible when the 90-day pause started that the data would have enough time to demonstrate that the drive toward protectionism must end. That hasn’t happened. As a result, these tariffs may be more durable.\n\nCompanies Have Paid a Lot of Money in Tariffs to Uncle Sam\n\nThe tax cuts in the One Big Beautiful Bill Act make revenue from tariffs all the more important. There is always a risk with any tax that a high rate disincentivizes activity and reduces the tax take. That hasn’t happened so far:\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iVMXSb5AACZ8/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nThe current baseline 10% rate might eventually prompt a fall in imports — which is, after all, the point of the exercise. For now, the revenue is some kind of a proof of concept. The 10% tariffs are, almost certainly, here to stay.\n\nTrump Went on a Winning Streak\n\nIn the last few weeks, Donald Trump has won massive extra defense spending from NATO allies. He’s passed through Congress a sweeping tax and spending bill. Immigrant arrivals have fallen dramatically. The economy is growing, bond yields are low and stocks are at a record. He has bombed Iran, and claimed victory as its conflict with Israel subsides.\n\nThere are areas where he hasn’t claimed a win (the killing goes on in Ukraine), and his victories today might not look so impressive in the long term. But this streak leaves him empowered, and makes the TACO (Trump Always Chickens Out) taunt harder to sustain. It could enable an unembarrassing retreat on tariffs, should he feel the need. But as he’s politically strong even after his honeymoon period, it’s likely the administration decides that it has more leverage. To quote Tina Fordham of Fordham Global Foresight:\n\nNo US ally should expect its historic relationship to carry any weight in these negotiations, and the lack of rhyme or reason to the numbers will not give comfort to observers looking for patterns. Trump is riding high post-OBBBA [One Big, Beautiful Bill Act], and this policy highlights his confidence that he “holds the cards.”\n\nTrump’s victories have made a continuing outright trade war more likely.\n\nThe Impact on Profits Remains Unknown\n\nProfits for the Liberation Day quarter will start to appear next week. Tariffs are paid by US importers and should bite into margins. But the weaker dollar counteracts this by raising the dollar value of non-US profits. According to Deutsche Bank AG’s Bankim Chadha:\n\nOver the prior four quarters, the appreciation of the US dollar was an increasing drag on S&P 500 earnings growth. In Q1, the dollar was up 5.7% year-on-year, implying a meaningful drag, especially for sectors with a large share of foreign sales such as tech and the industrials. In Q2, the sharp decline in the dollar has left it flat y-o-y, implying significant relief compared to Q1.\n\nEarnings expectations for the second quarter fell sharply after Liberation Day — more than in any of the previous five quarters. But the fall is over, and forecasts reported to Bloomberg showed an uncharacteristic slight increase just after the quarter-end:\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/ixol_1JEcbgk/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nThis earnings season figures to be important. Profits will be better than currently forecast because they always are. If they log a surprise on the scale of the last two quarters, that could again be taken as evidence that the 10% baseline tariffs haven’t hurt.\n\n[https://sli.bloomberg.com/imp?s=868532&stpe=default&li_coord=desktop&collapse_width=550&li=14140604&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07082025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\n[https://sli.bloomberg.com/imp?s=868532&stpe=default&li_coord=mobile&collapse_width=550&li=14140604&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07082025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\nWhat Next?\n\nDonald Trump, who used to run beauty pageants, appears to be modeling this process on Miss World. To amp up the drama, once the contestants had been whittled down to a final seven, those from fifth to second would be announced in turn. The three left would know that they had either won or were unplaced.\n\nThere’s something similar for the trading partners that haven’t yet received letters, which include the EU, India, Taiwan, Brazil, Turkey and Australia. Does this mean a deal is coming, or will one of them be hit by an escalation? Australia, with which the US has a trade surplus, might negotiate something positive. India had hopes of a deal. The EU is the most contentious but, according to Politico, believes it can avoid a letter. TACO Tuesday won’t be a damp squib if someone makes a deal, or gets hit with escalation.\n\nStubborn ‘Woke’ Clean Energy\n\nOn the face of it, Trump’s One Big, Beautiful Bill Act, now the law of the land, deals a decisive blow to clean energy and reboots fossil fuels. It eliminates most of the Biden-era Inflation Reduction Act’s clean energy tax credits, including for electric vehicles. This looks like a tectonic shift in the energy industry.\n\nBut there’s no pandemonium in the markets. This might just be a matter of time. The elimination of clean energy credits doesn’t come into effect immediately — their sunset dates vary. While credits for sales of electric vehicles and home solar and storage face strict year-end cutoffs, BloombergNEF’s Derrick Flakoll argues that utility-scale wind and solar power projects can potentially hit a narrow window that could buy them subsidies all the way into the next decade. That explains why two clean energy tracking exchange-traded funds, Invesco’s Solar and First Trust’s Global Wind Energy funds, continue to soar:\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i8yjNJ8FwnNk/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nStill, the new law’s 2027 deadline threatens to cut off a key revenue stream and would inject economic uncertainty. So how to explain the resilience of clean energy? The weak dollar may help. The wind ETF, in particular, is dominated by non-US stocks, so it benefits from the broader market performance buoyed by the weak dollar.\n\nThe dagger to the heart of America’s energy transition ambitions contrasts with the law’s embrace of “Drill, Baby, Drill” to expand exploration and production, notably on federal lands. But that will require an oil price to make it worth drillers’ while. Crude oil is down more than 12% since its brief flirtation with $80 per barrel during the Israel-Iran conflict. OPEC+’s unexpected decision to ramp up supply puts a lid on prices even if demand recovers:\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iRhUJ8IU4Gqk/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nTrump doesn’t therefore hold all the cards. While the current supply glut persists and external shocks such as wars or natural disasters are absent, prices will likely stay low. BNP Paribas’ Aldo Spanjer forecasts downward pressure from oversupply from US shale and Iran, and predicts that crude will end the year at $55 per barrel.\n\nFollowing the unexpected OPEC+ boost, crude could fall further. Bloomberg Economics’ Dina Esfandiary notes that Riyadh and other Gulf exporters want to stay on Trump’s good side, and this helps achieve his desire for lower oil prices. Spanjer believes OPEC+’s impact will be capped by domestic demand during the summer:\n\nA similar increase in September, however, would have a much larger bearish market impact, as the summer offset reduces and balances will likely look much less tight. We therefore believe the increases will slow down in September.\n\nAll else equal, this should ease inflationary pressures and count as a win for the administration. But creating an equilibrium in which oil prices stimulate production while gas prices stay low enough to keep consumers happy is a herculean task, impossible even. Something has to give. The anti-green agenda may succeed, but it will be hard to get investors to “Drill, Baby, Drill” without making people pay more at the pump.\n\n—Richard Abbey\n\nSurvival Tips\n\nAs the US has adopted epistolary diplomacy, announcing tariffs via letter, here’s some letter-writing music. Try Sealed with a Kiss, Love Letters, Dear John, Message in a Bottle, Messages, Letter to You, Nights in White Satin, or I’m Going to Sit Right Down and Write Myself a Letter and Write Away (covered by Paul McCartney). Not to forget the Box Tops’ hit “The Letter” and Joe Cocker’s unique interpretation of it.\n\nMore From Bloomberg Opinion\n\n* Bill Dudley: America, This Isn’t How You Lower Interest Rates\n* Liam Denning: Tesla Is More a Musk Dream Stock Than a Meme Stock\n* Marcus Ashworth: Gilt Market Tumult Signals Worse to Come\n\nWant more Bloomberg Opinion? OPIN. Or you can subscribe to our daily newsletter.\n\nLike Bloomberg's Points of Return? Subscribe for unlimited access to trusted, data-based journalism in 120 countries around the world and gain expert analysis from exclusive daily newsletters like Markets Daily or Odd Lots.\n\nLike getting this newsletter? Subscribe to Bloomberg.com for unlimited access to trusted, data-driven journalism and subscriber-only insights.\n\nWant to sponsor this newsletter? Get in touch here.\n\nYou received this message because you are subscribed to Bloomberg's Points of Return newsletter. If a friend forwarded you this message, sign up here to get it in your inbox.\nUnsubscribe\nBloomberg.com\nContact Us Bloomberg L.P.\n731 Lexington Avenue,\nNew York, NY 10022\n[Ads Powered By Liveintent] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i84ASdYMF2Xk/v0/-1x-1.png] [Ad Choices]",
+            "body_hash": "6c7357916e9f3485d919cd309002a424b5cf85cea616289938d32bb54d28dce7",
+            "tokens_est": 3555,
+            "body_truncated": false,
+            "body_chars": 14218,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOeoETPAABErAPl96N2RbTL607yO--6AAQvRizvAAA=",
+            "internet_message_id": "<8B.C6.27477.DE83C686@i-003733824b9ead41b.mta1vrest.sd.prd.sparkpost>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOfoW1RAAA=",
+            "subject": "We need an FAA for artificial intelligence",
+            "from_domain": "news.bloomberg.com",
+            "from_address": "noreply@news.bloomberg.com",
+            "body_preview": "The AI talent war is out of control.\r\nView in browser\r\n\r\n\r\n\r\n\r\n\r\n\r\nThis is Bloomberg Opinion Today, a dual-mandate agency tasked with regulating and promoting Bloomberg Opinion’s opinions. Sign up here.\r\n\r\nToday’s Agenda\r\n\r\n  *   Will AI workers take the ",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 9974,
+            "received_datetime": "2025-07-07T21:15:48.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:15.195Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Wave Life Sciences Ltd. is an innovative biotech with soli data for its AATD, Huntington's, and DMD programs.                                                                                                                                                            \n[https://email-st.seekingalpha.com/img/60af704f7bd2ac02811f0720o5vna.u2/95decde8.gif]\n\nWave Life Sciences: Upgrading Rating To Buy After Turbulent 10 Months\n\nJul 07, 2025 05:42 PM | Wave Life Sciences Ltd.(WVE) | By: Edmund Ingham\n\nRead the full article now »\n\nDownload the Seeking Alpha App!\n\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/AppStore%20badge.png]\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/GoogleBadge.png]\n\nLike our Breaking News? Try our other newsletters as well.\n\n \n\nThis email was sent to you because you signed up to receive Edmund Ingham Author Alerts. If you do not want to receive these real-time alerts, click here to unsubscribe.\n\nPast performance is no guarantee of future results. Any content and tools on the platform are offered for information purposes only. No recommendation or advice is being given as to whether any investment is suitable for a particular investor. Analysts are third party authors that include both professional investors and individual investors who may not be licensed or certified by any institute or regulatory body. Any views or opinions expressed may not reflect those of Seeking Alpha as a whole. Seeking Alpha does not take account of your objectives or your financial situation and does not offer any personalized investment advice. Seeking Alpha is not a licensed securities dealer, broker or US investment adviser or investment bank.\n\nSent by Seeking Alpha, 244 5th Ave, Suite 2705, New York, NY 10001",
+            "body_hash": "4e02aa00aed2b3d4a516252bb9e6a978d38002d24f4dd85d2a1ef229d8a414ce",
+            "tokens_est": 442,
+            "body_truncated": false,
+            "body_chars": 1766,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOfoW1RAABErAPl96N2RbTL607yO--6AAQvRjDJAAA=",
+            "internet_message_id": "<20250707160402.40583921.1573864@sailthru.com>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOeoETPAAA=",
+            "subject": "2 Undervalued High-Yield Sectors With Huge Tailwinds (Top Picks)",
+            "from_domain": "seekingalpha.com",
+            "from_address": "account@seekingalpha.com",
+            "body_preview": "Diversification is crucial for a stable, growing dividend portfolio, but overweighting high-conviction sectors can boost\r\n\r\nMust Reads\r\n\r\nFREE ARTICLE\r\n\r\n2 Undervalued High-Yield Sectors With Huge Tailwinds (Top Picks)\r\n\r\nDiversification is crucial for a ",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 77976,
+            "received_datetime": "2025-07-07T20:04:10.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:15.641Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Evening Briefing Americas\nView in browser\n[Bloomberg]\n[https://sli.bloomberg.com/imp?s=1148994&li=14139004&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=static]\n[https://sli.bloomberg.com/imp?s=1148994&li=14139004&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=desktop&collapse_width=550]\n[https://sli.bloomberg.com/imp?s=1148994&li=14139004&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=mobile&collapse_width=550]\n\nUS President Donald Trump has unveiled letters that threaten to impose higher tariff rates on key trading partners, including levies of 25% on goods from Japan and South Korea beginning Aug. 1.\n\nTrump also announced 25% rates on Malaysia and Kazakhstan, while South Africa would see a 30% tariff and Laos and Myanmar would face a 40% levy. The nations were the first in what the president promised would be a flurry of unilateral warnings and trade deals announced Monday, two days before agreements are due from trading partners facing his April 2 so-called reciprocal levies. White House Press Secretary Karoline Leavitt said around a dozen countries would receive notifications on Monday, and that additional letters will come shortly.\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i4BNe_HjQM9U/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nMany of the tariff rates were largely in line with what Trump had already announced nations were likely to face.\n\nAfter a 90-day reprieve from his initial so-called “reciprocal” tariffs, Trump lowered those duties to 10% to allow time for negotiations. Few nations did so successfully in the short time given, though Trump’s latest move effectively offers another extension that pushes the looming July 9 deadline until at least the beginning of August.\n\nTrump’s second-term rush to overhaul US trade policies has served as a steady source of uncertainty for markets, central bankers and executives trying to game out the effect on production, inventories, hiring, inflation and consumer demand — routine planning that’s hard enough without costs like tariffs that are on one day, off the next.\n\nStocks fell from all-time highs and the dollar climbed on Trump’s announcement. Read today’s Markets Wrap. —Jordan Parker Erb\n\nWhat You Need to Know Today\n\nOfficials confirmed the deaths of 27 campers and counselors who went missing from Camp Mystic, an all-girls Christian summer camp as cataclysmic floods tore through central Texas. Statewide, authorities counted more than 90 deaths and said the number was almost certain to climb as rescuers sorted through mounds of debris. Heavy rain continued in portions of the Hill Country on Monday, with the heaviest downpours producing 2 to 3 inches of rain per hour, according to the National Weather Service. The Hill Country region where most of the deaths occurred had been packed with vacationers, many of them families who flock to the region year after year to enjoy the rivers and streams that provide respite from the summer heat.\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/itCousf.7Uvg/v0/-1x-1.jpg]\nSearch and recovery workers dig through debris near Camp Mystic in Hunt, Texas, on July 6. Photographer: Jim Vondruska/Getty Images\n________________________________\n\nTesla shares fell after Elon Musk announced he’s forming a new political party, digging deeper into a pursuit that’s been a drag on his most valuable business. Musk announced over the weekend that he’ll take on Republicans and Democrats with the “America Party,” focusing on House and Senate seats for the next 12 months. After that, backing a candidate for president isn’t out of the question, Musk wrote on X. Tesla’s stock slid 6.8% shortly after the start of regular trading Monday. The shares already have declined 28% this year as the CEO’s politicking has hurt Tesla’s standing with car buyers.\n\n________________________________\n\nSaks Fifth Avenue and Neiman Marcus sales have declined, with Saks' sales falling 16% and Neiman Marcus' sales falling 10% in the quarter that ended in June. The $2.7 billion acquisition of Neiman Marcus by Saks Fifth Avenue’s owner last year was supposed to create a luxury powerhouse. Instead, both department stores are losing customers and sales to competitors including Bloomingdale’s and Nordstrom. Sales at each of the retailers have risen more than 10% during the same quarter, according to Bloomberg Second Measure.\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/ibrANtnmyWMM/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n________________________________\n\nWall Street's traditional currency strategies are no longer working, leaving even experienced traders baffled. Before Trump’s policies sent the dollar plunging, investors could reliably use a number of indicators to figure out how to trade. Europe cuts interest rates? Sell euros. Markets look jittery? Buy dollars. But now, traders say, those signals are misfiring more frequently. As a result, traders are being cautious, running smaller and simpler trades, and questioning whether the past few months will be a short-lived adjustment or the start of a harder-to-navigate era.\n\n________________________________\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iSCkQWSJwyUw/v1/550x381.jpg]\nWall Street Builds S&P 500 ‘No Dividend’ Fund in New Tax Dodge\nWall Street’s latest tax dodge doesn’t hide in the Cayman Islands or rely on complex derivatives. It’s engineered to turn a publicly traded fund into a tax-minimizing machine that hums quietly on autopilot.\nRead the Story\n________________________________\n\nCoreWeave is buying data-center operator Core Scientific in an effort to gain more direct control over the physical assets powering the artificial-intelligence boom. In buying Core Scientific in a $9 billion all-stock deal, CoreWeave will inherit more than a gigawatt of data-center capacity across the US — much of which is already contracted out to serve its clients in training, deploying and using AI models. CoreWeave said Monday that controlling more of its supply chain will eliminate lease expenses, reduce costs including those associated with financing projects.\n\n________________________________\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/isFkIEyuYcU8/v1/550x381.jpg]\nHigher Education\nNotre Dame Loses Protection From Endowment Tax in GOP Bill\nRead the Story\n[https://sli.bloomberg.com/imp?s=1099794&stpe=default&li_coord=desktop&collapse_width=550&li=14139004&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\n[https://sli.bloomberg.com/imp?s=1099794&stpe=default&li_coord=mobile&collapse_width=550&li=14139004&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\nWhat You’ll Need to Know Tomorrow\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iVB6vyDiP.gM/v1/129x86.jpg]\nExplainer\nWhat Is American Exceptionalism, and Is It Coming to an End?\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/ighlXhGKdo04/v1/129x86.jpg]\nIndicators\nCanadians’ Job Security Gets Shakier as Trade War Harms Growth\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iZ.JVF1PW3.Q/v1/129x86.jpg]\nBloomberg Editorial Board\nWeaker Banks Won’t Stabilize the Treasury Market\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iVe5ftCXq40o/v0/129x86.jpg]\nImmigration\nTrump Immigration Crackdown Sparks Fresh Unlawful-Conduct Claims\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/ikStNW4EEXkA/v1/129x86.jpg]\nHigher Education\nBoston University Cuts 120 Staff After Trump Funding Squeeze\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iebjbo4.Dd2Q/v1/129x86.jpg]\nWeather\nMisinformation on Cloud Seeding Swirls After Deadly Texas Floods\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iJwE9aSaZG38/v1/129x86.jpg]\nETFs & Mutual Funds\nCathie Wood Targets Investor Jitters With Buffer ETFs Designed to Limit Equity Losses\nFor Your Commute\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/ir0_ygZgpKkc/v0/550x381.jpg]\nBanking, Booze and 007’s Wheels: 10 Companies to Watch Right Now\nAnalysts at Bloomberg Intelligence have sifted through thousands of publicly traded companies to highlight a select few for investors.\nRead the Story\nMore from Bloomberg\n\nEnjoying Evening Briefing Americas? Get more news and analysis with our regional editions for Asia and Europe. Check out these newsletters, too:\n\n* Markets Daily for what’s moving in stocks, bonds, FX and commodities\n* Breaking News Alerts for the biggest stories from around the world\n* Opinion Today for an afternoon roundup of our most vital opinions\n\nExplore all newsletters at Bloomberg.com.\n\nThis newsletter is just a small sample of our global coverage. For a limited time, Evening Briefing readers like you are entitled to half off a full year’s subscription. Unlock unlimited access to more than 70 newsletters and the hundreds of stories we publish every day.\nSubscribe and save\n\nFollow Us\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i7G4HOaCfw0A/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iDRduxloBOSA/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i5QE5__h22bE/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iiSKUb3JWcLI/v0/-1x-1.png]\n\nBefore it’s here, it’s on the Bloomberg Terminal. Find out more about how the Terminal delivers information and analysis that financial professionals can’t find anywhere else. Learn more.\n\nWant to sponsor this newsletter? Get in touch here.\n\nYou received this message because you are subscribed to Bloomberg's Evening Briefing: Americas newsletter. If a friend forwarded you this message, sign up here to get it in your inbox.\nUnsubscribe\nBloomberg.com\nContact Us Bloomberg L.P.\n731 Lexington Avenue,\nNew York, NY 10022\n[Ads Powered By Liveintent] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i84ASdYMF2Xk/v0/-1x-1.png] [Ad Choices]",
+            "body_hash": "d811813af2737464ce06dbecd1024bd01d9f7ed426094d7d6ec793e816a54cf0",
+            "tokens_est": 2496,
+            "body_truncated": false,
+            "body_chars": 9981,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOfoW1RAABErAPl96N2RbTL607yO--6AAQvRjDIAAA=",
+            "internet_message_id": "<4D.06.39184.7050C686@i-021b2df53fdc5de36.mta1vrest.sd.prd.sparkpost>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOfoW1RAAA=",
+            "subject": "Missed the bonus savings? You can still save $150.",
+            "from_domain": "message.bloomberg.com",
+            "from_address": "subscriptions@message.bloomberg.com",
+            "body_preview": "Don't wait. This offer ends soon.\r\n\r\nSubscribe and save\r\n\r\nThis summer, get the global reporting and tools you need to outsmart the markets — for less. Subscribe today for just $299 $149/first year.\r\n\r\nSubscribe now\r\n\r\n\r\n\r\n\r\nView in browser\r\n\r\n\r\n\r\nPricing",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 83971,
+            "received_datetime": "2025-07-07T17:34:11.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:16.035Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "The AI talent war is out of control.\nView in browser\n[Bloomberg]\n[https://sli.bloomberg.com/imp?s=1149039&li=14138800&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=static]\n[https://sli.bloomberg.com/imp?s=1149039&li=14138800&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=desktop&collapse_width=550]\n[https://sli.bloomberg.com/imp?s=1149039&li=14138800&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=mobile&collapse_width=550]\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iN7Zr__EaUoo/v0/-1x-1.png]\n\nThis is Bloomberg Opinion Today, a dual-mandate agency tasked with regulating and promoting Bloomberg Opinion’s opinions. Sign up here.\n\nToday’s Agenda\n\n* Will AI workers take the bait?\n* The makings of a police state.\n* Parkas in July? Fans can’t wait.\n* Tesla’s stock feels like fate.\n\nAI Is Everywhere\n\nLet’s say you helped invent a revolutionary ice cube that stays frozen forever. Everyone from food manufacturers to Big Pharma wants to get their hands on the recipe. Your boss — let’s call her Pam Saltman — says your company’s sole mission is to ensure that your ice cubes benefit all of humanity. You love that idea, but when a recruiter for your main competitor offers you $300 million — enough money to buy the entire Red Hot Chili Peppers catalog — you’re tempted to hop jobs, even though forever-frozen ice is just one aspect of their business. Do you sell out, or do you stick with the feel-good mission of your current employer?\n\nThat’s the question that Dave Lee says is gripping Silicon Valley in its no-holds-barred talent war for AI: “OpenAI’s pitch to prevent its workers from leaving is to make the case that artificial general intelligence is the company’s one and only true goal, and every part of its work is dedicated to achieving it, whereas those working on Meta’s AI will spend at least some of their time thinking about how it can be used to better serve up shoddy viral videos to your grandmother.”\n\nRead between the lines and it’s clear that Sam Altman wants his employees to feel that they’re not just collecting a paycheck, they’re collecting a conscience, too. Yet even the best intentions can’t stop bad things from happening. Parmy Olson says “people are forming strong emotional bonds with [ChatGPT], sometimes exacerbating feelings of loneliness. And others are having psychotic episodes after talking to chatbots for hours each day.”\n\nPerhaps, then, the line between good AI and evil AI should be decided by regulators, not companies. Gautam Mukunda says there is no federal apparatus that oversees AI, something that needs to change. His big idea? A dual-mandate agency tasked with regulating and promoting AI, similar to how the FAA works. “This agency could certify AI systems (particularly those in high-risk applications), set safety standards, conduct safety audits and investigate accidents,” he writes.\n\nSuch an agency would likely be welcome news to college students and faculty around the world. In Asia, Catherine Thorbecke notes how educators are having a hard time keeping pace with how AI should be used in the classroom: “Even if some teachers discourage the use of AI, it has become almost unavoidable for scholars doing research in the internet age. Most Google searches now lead with automated summaries. Scrolling through these should not count as academic dishonesty,” she argues.\n\nOf course, there’s always the blunt-yet-effective option of banning technology in the classroom entirely:\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/irozxS5CZlKM/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nMary Ellen Klas says cellphone bans are gaining nationwide popularity, for good reason: “A growing body of research has found that the more time children and their developing brains spend on smartphones, the greater the risk of negative mental health outcomes — from depression, to cyberbullying, to an inability to focus and learn,” she writes. And that’s before AI promised a “doom loop of loneliness.”\n\n[https://sli.bloomberg.com/imp?s=868547&stpe=default&li_coord=desktop&collapse_width=550&li=14138800&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\n[https://sli.bloomberg.com/imp?s=868547&stpe=default&li_coord=mobile&collapse_width=550&li=14138800&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\nJuntos Somos Más Fuertes\n\nElsewhere in distressing maps, you have this Bloomberg News analysis showing all the new facilities the Trump administration is using to detain people:\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iBLxEMHK_VdY/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\n“Trump’s obsession with ridding the country of immigrants had already gone too far — and now he has the funds to take his crackdown even further,” writes Patricia Lopez. Hidden within the “Big, Beautiful Bill” the president signed on July 4 was a $100 billion payday for ICE and border control, an amount so astronomical that the Cato Institute’s David J. Bier says “they are going to be shoveling money out the door with very little oversight or checks on how it is to be spent.” To give you some context, the previous budget for ICE’s detention facilities was $3.43 billion. Now Homeland Security Secretary Kristi Noem gets $45 billion to try and keep 100,000 beds filled for the next four years.\n\nTrump claims those beds will be occupied by the “worst of the worst,” yet Patricia says many of them will be filled by non-criminals: farmers, day laborers, construction workers, hotel maids — the people who willingly take the lowest-paying jobs. Jobs that Justin Fox says are needed to power the economy. Notice how the list of suburbs with the highest foreign-born population share in the US correspond with some of the country’s most dynamic cities: Miami, New York, Los Angeles, San Francisco, San Jose and Boston.\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iYF41dk99NR8/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nNow compare that with a list of cities with the smallest foreign-born populations:\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iT5gQBI4SBq4/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nNotice a pattern? “These low-immigration cities are very nice places, but none has a median household income above the national median of $77,719, and that’s almost certainly not a coincidence. Immigrants to the US tend to congregate in and around the country’s most productive, most expensive cities,” Justin writes. “This, in turn, has helped counteract the ‘spatial misallocation of labor’ caused by too-scarce housing in such places ... making the US economy a bit more productive and all of us, on average, better off.”\n\nSo, to to be clear: ICE now has an annual budget that, by some calculations, is larger than Israel’s entire defense budget. And it will spend it on crackdowns that will eventually make the US economy less productive and less dynamic, something the American public definitely didn’t sign up for.\n\nThis newsletter is only a small sample of our global opinion coverage. For a limited time as an Opinion Today reader, you can get half off a full year’s subscription and unlock unlimited access to all of our columnists and exclusive newsletters. Don’t miss out.\nSubscribe and save\n\nTelltale Charts\n\nWhile Lara Williams says Europe is baking under extreme temperatures, Andrea Felsted says people are purchasing … parkas? No, really: “Despite the summer heat, average weekly TikTok posts featuring parkas rose 188% between June 1 and July 1, compared with the previous month” and “searches for parkas on secondhand marketplace Depop rose 1,850% in June, compared with the year-earlier period.” Luckily, it’s not because of some new weight-loss fad or Arctic travel hack. Instead, it’s because the band Oasis kicked off its highly anticipated reunion tour on Friday in Cardiff and people are splurging on ’90s fashion. “Retailers are jumping on what is being dubbed ‘Wonderwall Summer,’” she explains. Sounds like a recipe for heat stroke but what do I know!\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/itPbwJDbbQOc/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nWhat makes Tesla’s stock go up and down? That’s the question Liam Denning sought to answer in his latest column. Looking at the 10 biggest relative moves so far this year, he found “most of those days when Tesla thumped the market, the stock acted as a supercharged avatar for broader enthusiasm rather than being moved by some outsized event specific to the company … Conversely, Tesla’s most underwhelming days tend to coincide with bad news specific to the company’s core EV business.” Case in point? On Sunday, President Trump called Elon Musk a “train wreck” in a post about dismantling the EV mandate. By Monday, Tesla’s share price had tanked — perhaps that should be the 11th annotation to this chart.\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/ievxBBINYcOY/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\nFurther Reading\n\nPolicymakers have reason to worry about turbulence in “risk-free” Treasuries. — Bloomberg’s editorial board\n\nAsia’s richest tycoon is welcoming US cargo with open arms. — Andy Mukherjee\n\nIf Trump really wants lower interest rates, he’s doing it all wrong. — Bill Dudley\n\nInstead of celebrating a breakthrough HIV drug, aid groups are scrambling to keep the infected alive. — Lisa Jarvis\n\nIt's impossible to make one person the world's best chef. — Howard Chua-Eoan\n\nWhen the finance minister of the world’s sixth-largest economy cries in public, it’s more than a “tough day.” — Rosa Prince\n\nCrypto and bank startups look like they could run straight toward the Silicon Valley Bank trap. — Paul J. Davies\n\nIf you thought golden shares were a relic of the 1980s, think again. — Chris Hughes\n\nThe real-life Formula One should be more like Apple’s new F1 movie. — Adam Minter\n\nThe era of greenwashing is giving way to defense-washing. It won’t make Europe stronger. — Lionel Laurent\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/icsjld0V3rmg/v0/-1x-1.png]\nICYMI\n\nTragic floods in Texas kill more than 90 victims.\n\nTikTok is working on a new app ahead of sale.\n\nThe Jeffrey Epstein saga continues.\n\nKickers\n\nAustralia’s mushroom murder. (h/t Christine Vanden Byllaardt)\n\nWho needs an alarm clock when you have Percy the peacock?\n\nCardi B’s crow couture. (h/t Andrea Felsted for the last two kickers)\n\nFacebook job ads are not to be trusted.\n\nIs Wakuku the next Labubu?\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/ieDo7b1.vXC8/v0/-1x-1.png]\n\nNotes: Please send the bird in borrowed feathers and feedback to Jessica Karl at jkarl9@bloomberg.net.\n\nSign up here and find us on Bluesky, TikTok, Instagram, LinkedIn and Threads.\n\nFollow Us\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iDRduxloBOSA/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iiSKUb3JWcLI/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i_JvbwNnmprk/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/izMF6uUluOIo/v0/-1x-1.png]\n\nBefore it’s here, it’s on the Bloomberg Terminal. Find out more about how the Terminal delivers information and analysis that financial professionals can’t find anywhere else. Learn more.\n\nWant to sponsor this newsletter? Get in touch here.\n\nYou received this message because you are subscribed to Bloomberg's Opinion Today newsletter. If a friend forwarded you this message, sign up here to get it in your inbox.\nUnsubscribe\nBloomberg.com\nContact Us Bloomberg L.P.\n731 Lexington Avenue,\nNew York, NY 10022\n[Ads Powered By Liveintent] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i84ASdYMF2Xk/v0/-1x-1.png] [Ad Choices]",
+            "body_hash": "9d856a36ab35ff68ec6dde25700dce0b16117edaf6ce89eb876cc34ae912d108",
+            "tokens_est": 2980,
+            "body_truncated": false,
+            "body_chars": 11919,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOeoETPAABErAPl96N2RbTL607yO--6AAQvRizuAAA=",
+            "internet_message_id": "<6C.C7.29760.BC9FB686@i-082f532f7e248c6ae.mta1vrest.sd.prd.sparkpost>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOfoW1RAAA=",
+            "subject": "Money Stuff: Jane Street’s Indian Options Trade Was Too Good",
+            "from_domain": "news.bloomberg.com",
+            "from_address": "noreply@news.bloomberg.com",
+            "body_preview": "SEBI, MSOs, America Party.\r\nView in browser\r\n\r\n\r\n\r\n\r\nIndian options\r\n\r\nLast year, Jane Street Group sued Millennium Management for allegedly stealing its secret trade ideas. Jane Street had employed a couple of traders who discovered a trading strategy in",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 42558,
+            "received_datetime": "2025-07-07T16:46:19.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:16.437Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Diversification is crucial for a stable, growing dividend portfolio, but overweighting high-conviction sectors can boost\n[https://email-st.seekingalpha.com/img/65bb4db6aabcda91040d5fb1o5ur5.xqeg/7fc60714.gif]\n\nMust Reads\n\nFREE ARTICLE\n\n2 Undervalued High-Yield Sectors With Huge Tailwinds (Top Picks)\n\nDiversification is crucial for a stable, growing dividend portfolio, but overweighting high-conviction sectors can boost long-term total returns and i...\n\nRead for Free\n[https://static.seekingalpha.com/cdn/s3/uploads/getty_images/2189063052/image_2189063052.jpg?io=getty-c-w1536]\nFREE ARTICLE\n\n2 Undervalued High-Yield Sectors With Huge Tailwinds (Top Picks)\n\nDiversification is crucial for a stable, growing dividend portfolio, but overweighting high-conviction sectors can boost long-term total returns and i...\n\nRead for Free\n[https://static.seekingalpha.com/cdn/s3/uploads/getty_images/2189063052/image_2189063052.jpg?io=getty-c-w1536]\n \n\nSupercharge SCHD ETF With Big Dividend Machines\n\nSCHD is my favorite dividend growth ETF. I break down its strengths and weaknesses. I also share which stocks and funds I would buy alongside SCHD to ...\n\nContinue Reading\n[https://static.seekingalpha.com/cdn/s3/uploads/getty_images/2201143585/image_2201143585.jpg?io=getty-c-w1536]\n \n\nULTY: The Gambler's Income ETF\n\nULTY offers extremely high yield via aggressive, actively managed covered call strategies, but carries significant risk and volatility due to its focu...\n\nContinue Reading\n[https://static.seekingalpha.com/cdn/s3/uploads/getty_images/2210888767/image_2210888767.jpg?io=getty-c-w1536]\n \n\nREITs Score Key Tax Bill Wins\n\nU.S. equity markets closed the Independence Day week at record highs after Congress approved the GOP's sweeping tax cut and spending megabill, while e...\n\nContinue Reading\n[https://static.seekingalpha.com/cdn/s3/uploads/getty_images/2186186666/image_2186186666.jpg?io=getty-c-w1536]\n \n\nAmazon: Don't Wait Till It Enters Beast Mode\n\nAmazon's scale in e-commerce and cloud enables strong operating leverage, driving profitability despite slowing topline growth. AI and robotics invest...\n\nContinue Reading\n[https://static.seekingalpha.com/cdn/s3/uploads/getty_images/1317474419/image_1317474419.jpg?io=getty-c-w1536]\n[Facebook] [Twitter] [LinkedIn] [Instagram] [Flipboard]\n\nDownload the Seeking Alpha App!\n\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/AppStore%20badge.png]\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/GoogleBadge.png]\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/AppStore%20badge.png]\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/GoogleBadge.png]\n\nWant More Investing Ideas Newsletters?\n\nPopular ETF Ideas → ETFs Ideas\n\nGet the Newest Stock Ideas → Stock Ideas\n\nStock Ideas for Dividend Investors → Dividend Ideas\n\nLike Must Reads? Try our other newsletters as well.\n\nThis email was sent to you because you signed up to receive Must Reads. If you do not want to receive Must Reads emails, click here to unsubscribe.\n\nPast performance is no guarantee of future results. Any content and tools on the platform are offered for information purposes only. No recommendation or advice is being given as to whether any investment is suitable for a particular investor. Analysts are third party authors that include both professional investors and individual investors who may not be licensed or certified by any institute or regulatory body. Any views or opinions expressed may not reflect those of Seeking Alpha as a whole. Seeking Alpha does not take account of your objectives or your financial situation and does not offer any personalized investment advice. Seeking Alpha is not a licensed securities dealer, broker, US investment adviser, or investment bank.\n\nSent by Seeking Alpha, 244 5th Ave, Suite 2705, New York, NY 10001",
+            "body_hash": "35be6c2d9d57e35a4824b741575c5e7e8cd5d6d561827f9f6de47e0c1b9a5159",
+            "tokens_est": 960,
+            "body_truncated": false,
+            "body_chars": 3837,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOfoW1RAABErAPl96N2RbTL607yO--6AAQvRjDHAAA=",
+            "internet_message_id": "<20250707101504.40578439.1904@sailthru.com>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOeoETPAAA=",
+            "subject": "BYDDY: Electric stuff: BYD starts vehicle production in Brazil as it continues to expand outside of China",
+            "from_domain": "seekingalpha.com",
+            "from_address": "account@seekingalpha.com",
+            "body_preview": "Chinese electric vehicle giant BYD Companies (OTCPK:BYDDF) (OTCPK:BYDDY) began production of electric cars in Brazil on ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 17884,
+            "received_datetime": "2025-07-07T14:15:44.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:16.878Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Don't wait. This offer ends soon.\n\n[Bloomberg.com]\n\n[Take 50% off your first year.]\nSubscribe and save\n\nThis summer, get the global reporting and tools you need to outsmart the markets — for less. Subscribe today for just $299 $149/first year.\n\n[Take 50% off your first year.]\n[Take 50% off your first year.]\n[Take 50% off your first year.]\n[Take 50% off your first year.]\nSubscribe now\n\n[https://d15k2d11r6t6rl.cloudfront.net/public/users/Integrators/669d5713-9b6a-46bb-bd7e-c542cff6dd6a/f574328d4d0c4c359b90d8e49b10e21d/full-footer-filled.png]\n[https://d15k2d11r6t6rl.cloudfront.net/public/users/Integrators/669d5713-9b6a-46bb-bd7e-c542cff6dd6a/f574328d4d0c4c359b90d8e49b10e21d/footerMobile-2503-v2.png]\n[Get it on Google Play] [Download on the App Store]\n\nView in browser\n\nPricing may vary based on applicable currency.\n\nPlease do not reply to this message; it was sent from an unmonitored email address. If you received this message in error, please contact us.\n\nContact Us | Advertise | Unsubscribe\n\nCopyright 2025 | Privacy Policy\n731 Lexington Avenue, New York, NY 10022",
+            "body_hash": "5c0adcfd4c13b1b49b15119bb42ea2292f57f89eeb4d90b32d86ba7eb733c9d6",
+            "tokens_est": 270,
+            "body_truncated": false,
+            "body_chars": 1077,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOfoW1RAABErAPl96N2RbTL607yO--6AAQvRjDGAAA=",
+            "internet_message_id": "<20250707100205.40578193.45967@sailthru.com>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOeoETPAAA=",
+            "subject": "S&P 500 Powers Higher As Trade Deals, Tax Bill Move Forward",
+            "from_domain": "seekingalpha.com",
+            "from_address": "account@seekingalpha.com",
+            "body_preview": " \r\n\r\nMarket Outlook\r\n\r\nS&P 500 Powers Higher As Trade Deals, Tax Bill Move Forward\r\nBy Ironman at Political Calculations\r\nThe Bull Market Is Alive And Well\r\nBy Lance Roberts\r\nCautious Optimism Amid Policy Uncertainty\r\nBy Neuberger Berman\r\nWeekly Market Pu",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 84411,
+            "received_datetime": "2025-07-07T14:13:17.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:17.403Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "SEBI, MSOs, America Party.\nView in browser\n[Bloomberg]\n[https://sli.bloomberg.com/imp?s=1149004&li=14135029&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=static]\n[https://sli.bloomberg.com/imp?s=1149004&li=14135029&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=desktop&collapse_width=550]\n[https://sli.bloomberg.com/imp?s=1149004&li=14135029&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=mobile&collapse_width=550]\nIndian options\n\nLast year, Jane Street Group sued Millennium Management for allegedly stealing its secret trade ideas. Jane Street had employed a couple of traders who discovered a trading strategy in the [redacted] market. Jane Street did some initial testing and found results that were “counterintuitive, unexpected, and initially met with significant skepticism and incredulity internally at Jane Street”: It made so much money that everyone thought it was a mistake. Jane Street started running the strategy in the [redacted] market and made a lot of money. Eventually the traders left for Millennium, and then Millennium allegedly started running the same strategy, eating into Jane Street’s incredible profits.\n\nIn its lawsuit, Jane Street did not describe the strategy, or even name the [redacted] market in which it was operating, because “even identifying the country involved would lead to others ‘picking apart’ the details.” But in a court hearing, Millennium’s lawyers repeatedly said that the strategy involved options trades in India, “at multiple points apologizing to the judge for doing so.” Oops! Oh well.\n\nWe talked about this a couple of times, and I found it very amusing. (They settled in December.) Do you know who did not find it amusing? The Securities and Exchange Board of India, the Indian securities regulator. From SEBI’s perspective, the story here is:\n\n1. Jane Street found a counterintuitive way to extract unbelievable amounts of money from the Indian options market.\n2. It didn’t want anyone to know about it, because if that got out someone would blow up Jane Street’s spot.\n\nIf you are a national securities regulator and you learn that a big international firm is making unbelievable amounts of money in your markets and keeping it secret, that doesn’t sound like good news for you. SEBI was sort of obligated to blow up Jane Street’s spot, and last Thursday it did:\n\nIndia has temporarily barred Jane Street Group LLC from accessing the local securities market for alleged index manipulation, dealing a severe hit to the US firm that made $4.3 billion in trading gains there in more than two years.\n\nThe Securities and Exchange Board of India said it would seize 48.4 billion rupees ($570 million) from Jane Street, which it claimed is the total amount of “unlawful gains” made by the firm, according to a 105-page interim order by Ananth Narayan, a board member at the regulator, on its website. Jane Street said it disputes the findings.\n\nHere is the order, which says that SEBI started looking into Jane Street after reading about the Millennium lawsuit in the papers. Of course it did.\n\nI can tell you at least one counterintuitive thing about the Indian options market, which is that it is gigantic. “It accounts for around 80% of equity options contracts traded worldwide by daily turnover,” and it is by some measures much bigger than the Indian stock market. The SEBI order notes that, “on weekly index options expiry day, the comparable cash equivalent traded volumes in index options markets is several times the combined cash equivalent volumes traded in the associated futures and cash markets.” The order focuses on Jane Street’s trading on one day, Friday, Jan. 17, 2024, an expiration date for the then-popular weekly cash-settled options on the Nifty Bank index. [1] Roughly 103 trillion rupees’ worth of those options traded that day, [2] 353 times the trading volume of the 12 actual bank stocks that make up the index.\n\nTwo points here:\n\n1. That’s weird!\n2. Just from that paragraph you should know exactly what Jane Street is accused of doing.\n\nSo, first: It’s weird to have an options market that is much bigger than the underlying stock market. The explanation here seems to be largely that Indian retail investors enjoy a gamble, and the best way to gamble on stocks is with options. Here is a March 2024 Wall Street Journal story about the Indian retail options boom, noting that “individual investors in aggregate are losing large sums, while many brokerages and the stock exchanges are raking in cash.” And Bloomberg News notes today that “demand for so-called equity options in particular has exploded as large numbers of relatively inexperienced retail investors came in search of quick returns.”\n\nBut there is also a structural story: Compared to other big markets, it is harder to get leverage on cash stock positions or futures in India, or to sell stocks short. [3] Lots of leveraged and long/short trading strategies are harder to do in India, but options — which offer a lot of leverage — are a decent substitute. This suggests two things. First, some trading strategies that would be implemented using stocks in the US could be implemented using options in India. Second, some trading strategies that have to be implemented using stocks — like arbitraging options versus the underlying stocks — are harder to do in India, so some arbitrages won’t close and some spreads will be wider.\n\nMy second point was: Just from the fact that on some days the Indian options market is 353 times bigger than the Indian stock market, it is easy to see how you could get in trouble trading Indian options. Indian options trade much more liquidly than Indian stocks, but Indian options trade and settle based on the prices of Indian stocks. If you can move the stock prices, that mechanically moves the option prices. But the options are easier to trade (they are liquid), while the stock prices are easier to move (they are illiquid).\n\nSo the Nifty Bank index options that the SEBI order discusses are based on an index of 12 bank stocks. On the day SEBI discusses, Friday, Jan. 17, 2024, the index opened at 46,573.95 (down 3.2% from the previous day’s close of 48,125.10), traded as low as 45,789.60 and as high as 47,212.75 during the day, and closed at 46,064.45. There were call options on the index, bets that it would close above a certain price: For instance, a call option with a strike price of 47,000 would pay off zero if the index closed below 47,000, or 1 rupee per point that the index closed above 47,000. (The options are cash settled: You don’t get delivery of any stock; you just get cash based on the closing price.) And there were put options, bets that it would close below a certain price: A put option with a strike price of 47,000 would pay off zero if the index closed above 47,000, or 1 rupee per point that it closed below 47,000. At some points during the day the call option looked like it would pay off — the index traded as high as 47,212.75, which would make the call option worth 212.75 — but ultimately the index closed at 46,064.45, so the call option expired worthless and the put option paid out 935.55.\n\nBut the actual underlying stocks trade much less than the options do. So, schematically, you can buy 100 million rupees’ worth of call options, betting that the stock will go up, without moving prices too much. And then you can buy 10 million rupees’ worth of the 12 underlying bank stocks, but because those stocks are pretty illiquid, your buying will move prices up. This will cost you money — you’ll overpay for the stocks — but it will make you more money on the options: The option prices will go up mechanically to reflect the higher stock prices, and then you can sell your options at a profit (again without moving prices too much). SEBI says:\n\nOn weekly index option expiry day, many more entities and individuals trade in index options than do entities and individuals in the associated cash and futures markets. In other words, given the interrelationship between prices of derivative instruments and the prices of their underlying stocks or indices, many that trade in index options look for signals in the underlying index (determined by the smaller volumes and less number of participants in the underlying cash and futures markets), without themselves participating in these markets. …\n\nGiven the above, on weekly index option expiry day, by aggressively influencing the underlying cash and futures market with significant volumes (relative to those markets), a group of entities acting in concert with adequate funds and capital at their disposal, can influence and manipulate the index levels. This in turn can allow them to put on significantly larger and profitable positions in the highly liquid index options market by misleading and enticing large number of smaller individual traders. It could also be used to engineer the closing of the market on expiry day in a manner that benefits enormous index option positions that they may be running to expiry.\n\nAnd that’s what Jane Street allegedly did:\n\nJS Group first aggressively bought significant quantities of BANKNIFTY underlying constituent stocks and futures, temporarily pushing up or lending considerable support to the BANKNIFTY index. …\n\nJS Group ... actively traded BANKNIFTY puts and BANKNIFTY calls … [and] effectively took on active opposite side positions in BANKNIFTY index that were significantly higher in magnitude than the quantum of their intervention in the underlying cash and futures markets.\n\nThis is a pretty intuitive story, but there is a problem with it. Again, SEBI focuses on a single day, Friday, Jan. 17, 2024. On that morning (from 9:15 to 11:47 a.m.), “Jane Street Group aggressively accumulated significant long positions of INR 4,370.03 crores [INR 43.7 billion, about USD 512 million today] in BANKNIFTY constituents across both the cash and stock futures markets,” and this trading “coincided with JS Group simultaneously effectively selling BANKNIFTY via the index options segment.” In fact, Jane Street sold much more stock via options than it bought in cash: Its “net increase of cash-equivalent INR 32,114.96 crores [INR 321 billion] in short positions in BANKNIFTY via index options, in absolute terms, was 7.3 times the INR 4,370.03 crores [INR 43.7 billion] long position built by the group aggressively in the component cash/ futures markets.” So it was selling about 7.3 times as much index exposure (in the options market) as it was buying (in the cash and futures market).\n\nSEBI focuses in particular on the first 8 minutes of the trading day, “the 8-minute patch from 09:15:00 to 09:22:59 on January 17, 2024,” when Jane Street bought a lot of the top six banks in the index while also selling a lot of call options and buying a lot of put options:\n\nSuch activity, particularly in the opening minutes of the trading session, appears to have had a meaningful impact on the index level. The BANKNIFTY index moved significantly from 46,573.93 to 47,176.97 during this patch, a rise of over 600 points.\n\nThe intuitive story here is: By buying in the (illiquid) cash market, Jane Street was pushing up the price of the index, which pushed up the prices of index options, which allowed it to sell much more in the (liquid) options market and make a huge but manipulative profit.\n\nThe problem with this story is that the options went down. Page 26 of the SEBI order lays out the prices of various Nifty Bank index options during the eight-minute window that SEBI focuses on. Consider two options from the table:\n\n1. The 47,000 put. This is an option that would pay off if the index closed that day below 47,000. At 9:15 a.m., this was trading at 144.9.\n2. The 47,000 call. This is an option that would pay off if the index closed above 47,000. At 9:15 a.m., this was trading at 479.9.\n\nFrom the prices of these options, you can back out an implied price for the underlying index. Buying the call and selling the put is the equivalent of buying the underlying index [4] : You pay 335 for the combination (479.9 - 144.9), and then you get all the upside above 47,000 (from the call) and all the downside below 47,000 (from the put). Because you paid 335 of premium, this is the equivalent of buying the index at 47,335. So the options market implied an index level of 47,335 at 9:15 a.m. [5]\n\nNotice, though, that the actual index “moved significantly from 46,573.93 to 47,176.97 during this patch.” It started at 46,573.93, but the options started at 47,335. The options implied a price for the Nifty Bank index that was 1.6% higher than the actual price of the index: Retail investors were paying more for stock exposure via options than institutions were paying to buy the actual underlying stocks. (Why? The best explanation I’ve heard is that the index dropped a lot overnight, opening 3.2% below its previous close, and retail investors love to buy the dip — and in India they do that with options. So there was a ton of retail demand for Nifty Bank index exposure via options, which pushed the options prices higher than the underlying index.)\n\nBy 9:22 a.m., the premium had come down. At that time, according to SEBI, options implied a price for the index of about 47,187, [6] versus 47,176.97 for the actual index, a premium of about 0.02%. And this was below the options-implied index price at 9:15 a.m. As Jane Street was buying the underlying stocks, “temporarily pushing up or lending considerable support to the BANKNIFTY index,” the prices of options on that index were going down.\n\nThis is a very different story from the one SEBI tells. This does not look like manipulation; it looks like arbitrage. This is: Jane Street came in one Friday morning and noticed that Indian retail traders were buying options on the Nifty Bank index at much higher prices than where the index was actually trading. So Jane Street got to work doing what it does: It sold options to retail traders who wanted them, and bought the underlying stocks to hedge, until the arbitrage closed. (More strictly, it net sold call options and net bought put options, giving retail traders long exposure to the index. [7] ) At the beginning of SEBI’s window, the options were trading at a pretty wide 1.6% premium to the underlying index; at the end, they were trading at basically the “correct” levels.\n\nOver the weekend, Jane Street sent an email to its employees disputing SEBI’s characterization of its trading and explaining those eight minutes:\n\nThose eight minutes illustrate basic index arbitrage trading, which many of you will know as a core and commonplace mechanism of financial markets that keeps the prices of related instruments in line. One can easily observe that there was a large divergence between the price of the BANKNIFTY index (NSEBANK Index on Bloomberg) reflected in options markets and the price implied by the stock levels. Jane Street (presumably alongside other market participants) traded in a direction consistent with closing that gap and bringing the two markets more in line with one another.\n\nThere is a graph:\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i9Hq0K0GzDCc/v0/-1x-1.png]\n\nThe red line is the actual index price (based on the underlying stocks); the blue line is the index price implied by the options. (The times are 2.5 hours ahead of Indian time, so this chart starts at 9:15 a.m.) The options opened at prices that were much higher than the stocks, so Jane Street naturally sold the options and bought the stocks.\n\nIn a classic index arbitrage, Jane Street would have bought about as much stock (in actual stock or futures) as it sold (in options), capturing a risk-free profit as the prices converged. That’s not what happened here: Jane Street sold much more (in options) than it bought (in stock). I don’t know why, though I assume the answer is some combination of “Jane Street had a fundamental view that the options-implied price was too high” [8] and “Indian stocks are much less liquid than options, so it couldn’t fully hedge.” But that chart does not look especially like manipulation. If two identical assets — here, the cash index and the options-derived index — trade at different prices, you buy the cheap one and sell the expensive one, and Jane Street did. [9]\n\nSEBI spends a lot of time on the first eight minutes of trading that day, but more broadly the pattern is that Jane Street bought stock and sold options in the morning, and then sold back its stock in the afternoon. Why did it sell back the stock in the afternoon? SEBI describes this as “extended marking the close.”\n\n‘Extended marking the close’ refers to a manipulative trading practice where an entity aggressively places large buy or sell orders in the final moments of a trading session, with the specific intent of influencing the closing price of a security or index to its advantage. This practice is particularly concerning on derivative expiry days, as the closing price directly affects the settlement value of index-based contracts, thereby impacting payoffs for all market participants. Typically, extended marking the close involves aggressive and large buying (or selling) of securities just before market close to push the price up (or down), to ensure the reference stock or the index sets at a level more favourable for even larger derivative positions that are being settled on that day.\n\nThat is: Jane Street got very net short in the morning, by buying some stock but selling much more stock via options. Its options expired at the close, and the lower the closing price was, the more money it would make on its short positions. So it dumped its stock aggressively into the close to drive down the closing prices.\n\nBut these trades were what you might call “zero-day” options: The Nifty Bank index options expired weekly on Friday, and SEBI is looking at the trading patterns on those expiry days. Retail customers bought a ton of options Friday morning, knowing they would expire Friday afternoon. Jane Street, in effect, sold them the options on Friday morning (when they were overpriced), and hedged by buying the underlying stock. But the options expired (and cash settled) on Friday afternoon: In effect, Jane Street had to buy them back on Friday afternoon (at whatever the closing price was). If the hedge for selling the options is buying the stock, the hedge for buying back the options is selling back the stock. [10]\n\nBut that’s also the way to mark the close: If you were legitimately hedging expiring options positions, or illegitimately manipulating the closing prices to profit from your expiring options positions, either way your behavior would be roughly the same (you’d sell stock toward the end of the day). There would be some differences, though. Traditionally the way to “mark the close” is to trade at the close: If you buy aggressively in the last half-hour, that has more of an impact on pushing up the index than if you trade over a longer period. “Extended marking the close” is less effective, as manipulation, than quick marking the close. SEBI criticizes Jane Street for selling stock “aggressively” over the last hour of trading, but it also notes that “the Volume Weighted Average Price in the last 30 minutes of trading (between 15:00 and 15:30) is used to compute settlement prices” for the options. If you were trying to mark the close, you might sell all your stock in the last half-hour (when trades count toward the closing price), not the last full hour.\n\nI suppose the main point here is that, in many cases, “legitimately doing an arbitrage trade” and “trading in one market to manipulate prices in another market” look pretty similar. Either way, you are trading the opposite way, buying stock in the stock market and selling it in the options market or vice versa. The difference can be subtle, and I often joke that the difference between legitimate trading and manipulation is whether you send your colleagues an email saying “lol I sure manipulated that market.”\n\nStill, there is a philosophical difference. If Jane Street was doing a legitimate arbitrage trade, that would have the tendency to make markets more efficient, to reduce the prices that Indian retail investors were paying for their options. If it was doing market manipulation, that would have the tendency to make markets less efficient, to make options more expensive for the Indian retail investors.\n\nI don’t know what happened here, but judging by SEBI’s own chosen example, it looks like Jane Street was making markets more efficient and benefiting, rather than harming, retail traders. Instead of paying a 1.6% premium to buy stocks in the options market, they could pay a zero-ish premium; Jane Street pushed the options prices down and closed the arbitrage.\n\nBut it also made a ton of money? You can see how all of this might be “counterintuitive, unexpected, and initially met with significant skepticism and incredulity.” The story here is something like “Indian options were so popular, and so hard to arbitrage, that Jane Street could make billions of dollars just moving them to their correct prices.” That story should be annoying to SEBI too, even if it’s not Jane Street’s fault.\n\n[https://sli.bloomberg.com/imp?s=868432&stpe=default&li_coord=desktop&collapse_width=550&li=14135029&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\n[https://sli.bloomberg.com/imp?s=868432&stpe=default&li_coord=mobile&collapse_width=550&li=14135029&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\nMSO M&A\n\n“Imagine,” I wrote last month, “if mergers and acquisitions were illegal.” It is a useful little thought experiment. In a world where M&A was illegal, big companies would still want to buy smaller companies, but they couldn’t. They would need to construct indirect workarounds. I discussed a few:\n\nIf a big company liked a small company’s employees, it could hire them all; that’s not a merger. If it liked a small company’s product, it could enter into some sort of commercial arrangement, an exclusive licensing deal or sales partnership or supplier relationship or whatever, and end up selling the small company’s products to its own customers. All sorts of commercial arrangements are possible that stop short of buying the company, which, in this hypothetical, is illegal.\n\nWe were talking mostly about recent trends in tech companies, where (1) there has been a lot of regulatory scrutiny of acquisitions and (2) big tech companies have used workarounds like these (acquihires, exclusive commercial arrangements) to get around that scrutiny.\n\nBut there are other applications. At Business Insider this weekend, Jacob Shamsian wrote about law firm M&A. In the US, M&A for law firms is not exactly illegal (law firms merge all the time), but it is severely restricted: For the most part, only other law firms can buy law firms, because “nearly every state has adopted a professional ethics rule from the American Bar Association forbidding lawyers from working for nonlawyer-owned firms.” So US law firms mostly can’t go public, or be acquired by public companies, or be acquired by private equity funds.\n\nBut … could a private equity fund enter into some sort of commercial arrangement, an exclusive sales partnership where it sells the law firm’s services to clients and takes a cut of the revenue? Sure I guess. Shamsian:\n\nThe loophole, known as a “managed services organization” — or MSO — allows non-lawyers to effectively own part of law firms through a second corporate entity. …\n\nAs a workaround, the law firms can set themselves up as two corporate entities, [lawyer Lucian] Pera said. One is the law firm itself, composed exclusively of lawyers and owned only by lawyers. The second is the service organization, which can be owned by anyone and acts as a vendor for the law firm. It is essentially the back office, taking care of all non-lawyer tasks, including marketing, accounting, human resources, real estate leases, and employing paralegals. The two corporate entities enter into a long-term contract.\n\nUnder this MSO arrangement, non-lawyers can invest in the service corporation, though not the law firm itself. Presto! You have an ethically independent group of lawyers who are exclusively working with a company that can sell shares, Pera says.\n\nAccording to Pera, no state bars have issued ethics opinions that expressly bless the MSO model, but no court or regulator has found a problem with it, either.\n\nGood enough! If the MSO is the exclusive vendor of the law firm’s legal services, then owning the MSO is economically pretty close to owning the law firm.\n\nOh Elon\n\nI feel like at this point no one’s long-term thesis on Tesla Inc. is “from here on out, Elon Musk will spend all his time and energy making Tesla the very best cars-and-robots company it can be.” There was probably a time when Musk was monomaniacally focused on Tesla, but that was a long time ago. Or, rather, there was probably a 17-minute window last week when Musk was monomaniacally focused on Tesla, but the last two-week stretch like that was a decade ago. “Although Mr. Musk spends significant time with Tesla and is highly active in our management,” says Tesla in its securities filings, “he does not devote his full time and attention to Tesla. For example: Mr. Musk also currently holds management positions at Space Exploration Technologies Corp., X Corp., X.AI Corp., Neuralink Corp. and The Boring Company, and is involved in other ventures and with the Department of Government Efficiency.” But also a lot of online gaming, and getting in tedious fights online about his gaming, and other distractions.\n\nStill, I assume that a lot of people have short-term trades with theses like “this week he’s gonna keep quiet and work and the stock will go up,” or “he seems bored, probably this week he’s gonna do some wild stuff and the stock will go down.” The stock really did go up in May, as Musk left DOGE and promised to spend more time with Tesla. And now this:\n\nTesla Inc. shares fell after Elon Musk announced he’s forming a new political party, digging deeper into a pursuit that’s been a drag on his most valuable business.\n\nThe chief executive officer announced over the weekend that he’ll take on Republicans and Democrats with the “America Party,” focusing on House and Senate seats for the next 12 months. After that, backing a candidate for president isn’t out of the question, Musk wrote on X.\n\nTesla’s stock slid 8% shortly after the start of regular trading Monday. If that move were to hold, it would be the biggest drop since Musk’s initial falling out with Donald Trump over the president’s tax bill in early June.\n\nSure! Okay! Whatever! What if your thesis was “Elon Musk’s America Party will do great, it will be very popular, it will back great candidates who will win a lot of seats, those candidates will be more generous to electric vehicles than the current government, and ultimately this political endeavor will be good for the business fortunes of Tesla specifically”? Ha ha ha. The market consensus is otherwise.\n\nThings happen\n\nCoreWeave to Buy Core Scientific in $9 Billion Deal. Trump Sets Aug. 1 Tariff Start Ahead of Wednesday Deadline. Private-Equity Fundraising Sputters Through 2025’s First Half. Investors pile into tokenised Treasury funds. Andrew Left Set to Appear in Court in Push to Toss Fraud Charges. The Real-Estate Sons Have Taken Over. “If you’re looking for work-life balance, this isn’t it.” Liechtenstein hit by Russia-linked ‘zombie trust’ crisis.\n\nIf you'd like to get Money Stuff in handy email form, right in your inbox, please subscribe at this link. Or you can subscribe to Money Stuff and other great Bloomberg newsletters here. Thanks!\n\n[1] Bloomberg News notes that, “as the nation’s derivatives market grew around 40-fold to become the world’s biggest, Sebi introduced severe curbs to rein in the speculative trading that cost individual investors billions of dollars in losses. Among the measures, traders’ favorite contract, the weekly option on the Nifty Bank Index — which the regulator cited in its interim order — ceased to exist.” Here is a December story about the crackdown on that option.\n\n[2] \"Worth\" is not quite right. Actually this number is “options cash equivalent (or Futures equivalent or delta equivalent) traded turnover,” and later it seems clear that SEBI is describing the underlying delta of the options. (An at-the-money option on 100 shares has a notional amount equal to 100 shares, but a delta amount equal to 50 shares; a put/call combo, of the type we will discuss below, is \"delta one,\" meaning that it is equivalent to the underlying shares.)\n\n[3] Here is an X post from Andrew Peretti laying out some of the structural issues: SEBI restricts intraday margin lending and stock lending, and in 2018 it moved to require physical settlement of futures. So options are often the preferred way to get leverage. The SEBI order says: “A core reason for this phenomenon [i.e., greater volumes and liquidity in options than in cash trading] is likely that market participants enjoy enormous ‘leverage’ from options. As an example, to take delivery of a stock priced at INR 100 in the cash market, one needs to put up cash to the extent of INR 100. To buy a futures contract on the same underlying stock, one needs to put up adequate margin, say of INR 20. To that extent, there is an effective leverage of five times available to the participant, in taking up the same cash-equivalent exposure via futures markets, as opposed to via cash markets. Of course, the leverage also implies higher risk for the participant. In the options market, on the other hand, if one were to buy a call option at a strike price of INR 100 (At-The-Money or ATM strike) on two shares of the same underlying stock, with just one day to expiry and assuming 25% implied volatility, the option may only cost around INR 1. The underlying cash-equivalent economic exposure of this long-call ATM option position on two shares, at the time of trading, would be equivalent to being long one underlying share (the ‘cash equivalent’ or ‘future equivalent’ or ‘delta equivalent’ risk). This position has been put up with an outlay of just INR 1, representing a 100-times leverage over taking the same position directly in the cash market, or a 20-times leverage over taking the same position via futures markets.”\n\n[4] Options people will say that it’s equivalent to buying the *forward*, but these are zero-day options so forward and spot are pretty much the same.\n\n[5] I’ve used just one series of options to keep this simple, but page 26 of the SEBI order lists a bunch of options with strikes from 46,800 up to 47,700, and they are all pretty consistent, implying index levels from 47,329 to 47,337 at their 9:15 a.m. prices.\n\n[6] Again, that’s just eyeballing the 47,000 combo; the actual numbers vary slightly from 47,186 to 47,189 for different series.\n\n[7] That is, it was net selling the forward via options combos (selling call options and buying put options). Table 15 of the SEBI order (pages 28-31) tabulates its trades in various option strikes; there were trades on both sides but broadly the summary is “net sold a lot of calls and bought a lot of puts.” SEBI says: “In the context of the full Patch I, the Group was seen buying BANKNIFTY Put options and selling BANKNIFTY Call options. During this patch, the delta position rose from the day’s open of negative INR 7,311.19 Crores to negative INR 39,426.15 Crores by 11:47 AM, indicating an increase in bearish sentiment to the tune of INR 32,114.96 Crores.”\n\n[8] That is: These trades have the flavor of index arbitrage, but they are not pure index arbitrage; there is a fairly large amount of short-term directional betting. Alexander Gerko of XTX has a LinkedIn post about the SEBI case, in which he says: “As far I know everyone in the industry was completely stumped by the amount of money JS were making in India. Fundamentally these businesses are intermediaries between buyers and sellers which sort of puts a cap on how much money everyone combined can make, as a function of market volume/spreads/volatility. Moreover entry of new participants of this type dampens the volatility/tightens the spreads further, making overall pool size smaller. Based on earlier revenue leaks it felt that JS alone exceeded this cap. They certainly were making much more money there than everyone else combined.” One possible explanation of this is that Jane Street was not *solely* doing an intermediation, but also making outright bets, so it could make more money than just, as it were, the bid/ask spreads on the options.\n\n[9] Also the prices converge at around the highs of the day. After that, Jane Street kept buying stock and selling options, but if it were doing that to manipulate up the price of the options, you might expect to see the overall index level rise. But it fell.\n\n[10] From Jane Street’s employee email: “The Order uses similarly inflammatory language (‘Extended Marking the Close Strategy’) to describe our trading in underlying stocks during the Indian market closing period. The nature of the Indian market, where market participants disproportionately transact in cash-settled index options, means that those participants who provide liquidity (us and others) accumulate stock price exposure which ceases to exist at the point of options expiration. Replacing expiring deltas with non-expiring deltas is a standard and well-understood practice in markets throughout the world.”\n\n[Listen to the Money Stuff Podcast]\nFollow Us [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i7G4HOaCfw0A/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iDRduxloBOSA/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i5QE5__h22bE/v0/-1x-1.png] Get the newsletter\n\nLike getting this newsletter? Subscribe to Bloomberg.com for unlimited access to trusted, data-driven journalism and subscriber-only insights.\n\nBefore it’s here, it’s on the Bloomberg Terminal. Find out more about how the Terminal delivers information and analysis that financial professionals can’t find anywhere else. Learn more.\n\nWant to sponsor this newsletter? Get in touch here.\n\nYou received this message because you are subscribed to Bloomberg's Money Stuff newsletter.\nUnsubscribe | Bloomberg.com | Contact Us\n[Ads Powered By Liveintent] | [Ad Choices]\nBloomberg L.P. 731 Lexington, New York, NY, 10022",
+            "body_hash": "bf5a5a2c32e2071dd6ce8d21b193a3f94e3faf9385711f4524a5e7d5cd12ad3e",
+            "tokens_est": 8669,
+            "body_truncated": false,
+            "body_chars": 34673,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOeoETPAABErAPl96N2RbTL607yO--6AAQvRiztAAA=",
+            "internet_message_id": "<20250707094014.40577884.46283@sailthru.com>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOeoETPAAA=",
+            "subject": "MSFT: Microsoft: Time For Trimming (Rating Downgrade)",
+            "from_domain": "seekingalpha.com",
+            "from_address": "account@seekingalpha.com",
+            "body_preview": "Microsoft's strong cloud and AI-driven growth have propelled the stock to my previous price target, leaving little margi ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌ ͏‌",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 9709,
+            "received_datetime": "2025-07-07T13:40:22.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:17.829Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Chinese electric vehicle giant BYD Companies (OTCPK:BYDDF) (OTCPK:BYDDY) began production of electric cars in Brazil on                                                                                                                                                            \n[https://email-st.seekingalpha.com/img/60af704f7bd2ac02811f0720o5qiv.1gw/03653ce2.gif]\n\nElectric stuff: BYD starts vehicle production in Brazil as it continues to expand outside of China\n\n10:13 AM | BYD Company Limited (BYDDY) | By: SA Editor Clark Schultz, SA News Editor\n\nDownload the Seeking Alpha App!\n\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/AppStore%20badge.png]\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/GoogleBadge.png]\n\nLike our Breaking News? Try our other newsletters as well.\n\n \n\nThis email was sent to you because you signed up to receive this Breaking News Alerts. If you do not want to receive these real-time alerts, click here to unsubscribe.\n\nPast performance is no guarantee of future results. Any content and tools on the platform are offered for information purposes only. Seeking Alpha does not take account of your objectives or your financial situation and does not offer any personalized investment advice. Seeking Alpha is not a licensed securities dealer, broker or US investment adviser or investment bank.\n\nSent by Seeking Alpha, 244 5th Ave, Suite 2705, New York, NY 10001",
+            "body_hash": "23766db3d4f16c6b907157bd82972ee739bf27c377f5a3daa4bc1978b028a881",
+            "tokens_est": 355,
+            "body_truncated": false,
+            "body_chars": 1420,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOeoETPAABErAPl96N2RbTL607yO--6AAQvRizsAAA=",
+            "internet_message_id": "<20250707081411.40576954.425385@sailthru.com>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOeoETPAAA=",
+            "subject": "Pre-market summary on your portfolio: Portfolio 1",
+            "from_domain": "seekingalpha.com",
+            "from_address": "account@seekingalpha.com",
+            "body_preview": "See the latest news & analysis on your portfolio...\r\n\r\nPre-market Portfolio Digest\r\n* As of Mon, Jul 07, 2025 08:00 ET\r\nYesterday's Performance\r\nTop Gainers\r\nPLTR: +1.7%\r\nMSFT: +1.58%\r\nTop Gainers\r\nPLTR: +1.7%\r\nMSFT: +1.58%\r\nSee all of your holdings »\r\nFE",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 33868,
+            "received_datetime": "2025-07-07T12:14:16.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:18.339Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "[https://email-st.seekingalpha.com/img/60af704f7bd2ac02811f0720o5qc1.zgv/c1b432ca.gif]\n \n\nMarket Outlook\n\nS&P 500 Powers Higher As Trade Deals, Tax Bill Move Forward\nBy Ironman at Political Calculations\nThe Bull Market Is Alive And Well\nBy Lance Roberts\nCautious Optimism Amid Policy Uncertainty\nBy Neuberger Berman\nWeekly Market Pulse: The Crossroads\nBy Joseph Calhoun\nS&P 500: This Is Unusual, Week Starting 7th July (Technical Analysis)\nBy Andrew McElroy\n\nMore Market Outlook Analysis »\n\n \n\nGold & Precious Metals\n\nSilver Is Very Close To A Mania Phase (Technical Analysis)\nBy Hubert Moolman\nGold Mining Stocks: Winners And Losers At The Start Of H2 2025\nBy MarketGyrations\n\nMore Gold & Precious Metals Analysis »\n\n \n\nCommodities\n\nCommodities: OPEC+ Surprises With A Larger Supply Increase\nBy ING Economic and Financial Analysis\n\nMore Commodities Analysis »\n\n \n\nEconomy\n\nEurozone Retail Sales Drop In May, Confirming Second Quarter Weakness\nBy ING Economic and Financial Analysis\nPrivate Payrolls Shed Jobs For The First Time In Years\nBy Jack Bowman\nThere's More To German Industry Than Just U.S. Front-Loading\nBy ING Economic and Financial Analysis\nA Checkup On The Economic Screws\nBy ANG Traders\n\nMore Economy Analysis »\n\n \n\nForex\n\nU.S. Dollar Extends Recovery; Tariffs Loom But Now On August 1\nBy Marc Chandler\n\nMore Forex Analysis »\n\n \n\nReal Estate\n\nAngel Oak: A Mortgage REIT To Hold As Profit Margins Impress, Amid Loan Growth\nBy Albert Anthony\nGetty Realty: Undervalued REIT Poised For A Recovery\nBy IWA Research\n\nMore Real Estate Analysis »\n\nDownload the Seeking Alpha App!\n\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/AppStore%20badge.png]\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/GoogleBadge.png]\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/AppStore%20badge.png]\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/GoogleBadge.png]\n\nWant More Investing Ideas Newsletters?\n\nGet the Newest Stock Ideas → Stock Ideas\n\nPopular ETF Ideas → ETFs Ideas\n\nStock Ideas for Dividend Investors → Dividends Ideas\n\nLike Macro View? Try our other newsletters as well.\n\n \n\nThis email was sent to you because you signed up to receive Macro View Daily.\nIf you do not want to receive Macro View Daily emails, click here to unsubscribe.\n\nPast performance is no guarantee of future results. Any content and tools on the platform are offered for information purposes only. No recommendation or advice is being given as to whether any investment is suitable for a particular investor. Analysts are third party authors that include both professional investors and individual investors who may not be licensed or certified by any institute or regulatory body. Any views or opinions expressed may not reflect those of Seeking Alpha as a whole. Seeking Alpha does not take account of your objectives or your financial situation and does not offer any personalized investment advice. Seeking Alpha is not a licensed securities dealer, broker or US investment adviser or investment bank.\n\nSent by Seeking Alpha, 244 5th Ave, Suite 2705, New York, NY 10001",
+            "body_hash": "f5e4065f571716b0268cac1cab6d4f3195302d99bae305180cae8d42077852d6",
+            "tokens_est": 777,
+            "body_truncated": false,
+            "body_chars": 3106,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOeoETPAABErAPl96N2RbTL607yO--6AAQvRizrAAA=",
+            "internet_message_id": "<20250707075852.40576819.60907@sailthru.com>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOeoETPAAA=",
+            "subject": "S&P 500: This Is Unusual, Week Starting 7th July (Technical Analysis)",
+            "from_domain": "seekingalpha.com",
+            "from_address": "account@seekingalpha.com",
+            "body_preview": " \r\n\r\nTrending Articles - Monday, Jul 07\r\n\r\nS&P 500: This Is Unusual, Week Starting 7th July (Technical Analysis)\r\nBy Andrew McElroy\r\nAmazon: Don't Wait Till It Enters Beast Mode\r\nBy JR Research\r\nSupercharge SCHD ETF With Big Dividend Machines\r\nBy High Yie",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 12617,
+            "received_datetime": "2025-07-07T11:59:29.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:18.881Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Microsoft's strong cloud and AI-driven growth have propelled the stock to my previous price target, leaving little margi                                                                                                                                                            \n[https://email-st.seekingalpha.com/img/65bb4db6aabcda91040d5fb1o5q3g.zpn/516429b1.gif]\n\nMicrosoft: Time For Trimming (Rating Downgrade)\n\nJul 07, 2025 09:38 AM | Microsoft Corporation(MSFT) | By: Danil Sereda\n\nRead now »\n\nFEATURED: Be a better investor with Premium\n\nEnhance your investing strategy with Seeking Alpha Premium's 360° stock coverage, in-depth research tools, vibrant investor community, and AI-powered Virtual Analyst Reports. As one member wrote recently: \"Your portfolio will thank you.\"\n\nJoin Premium »\n\nDownload the Seeking Alpha App!\n\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/AppStore%20badge.png]\n[https://media.sailthru.com/composer/images/sailthru-prod-6yy/GoogleBadge.png]\n\nLike our Breaking News? Try our other newsletters as well.\n\n \n\nThis email was sent to you because you signed up to Real-time Alerts for the MSFT. If you do not want to receive these real-time alerts, click here to unsubscribe.\n\nPast performance is no guarantee of future results. Any content and tools on the platform are offered for information purposes only. No recommendation or advice is being given as to whether any investment is suitable for a particular investor. Analysts are third party authors that include both professional investors and individual investors who may not be licensed or certified by any institute or regulatory body. Any views or opinions expressed may not reflect those of Seeking Alpha as a whole. Seeking Alpha does not take account of your objectives or your financial situation and does not offer any personalized investment advice. Seeking Alpha is not a licensed securities dealer, broker or US investment adviser or investment bank.\n\nSent by Seeking Alpha, 244 5th Ave, Suite 2705, New York, NY 10001",
+            "body_hash": "7d9b79783fafc368af6a846f598247698cda7ebe910bd17be7370548d99df22b",
+            "tokens_est": 508,
+            "body_truncated": false,
+            "body_chars": 2031,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOeoETPAABErAPl96N2RbTL607yO--6AAQvRizoAAA=",
+            "internet_message_id": "<1751889288868.22648246-6c36-4b6f-a451-3ed11f9fad44@139754362m.seekingalpha.com>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOeoETPAAA=",
+            "subject": "Is Politics The Only Way Forward For Tesla?",
+            "from_domain": "seekingalpha.com",
+            "from_address": "account@seekingalpha.com",
+            "body_preview": "Elon Musk is threatening to upend politics in the U.S. with a brand new party. Would you ever consider voting for third-party candidates? • No ...\r\n        Read in Browser\r\n\r\n\r\nOutlook\r\nSurvey Monday\r\nElon Musk is threatening to upend politics in the U.S.",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 65380,
+            "received_datetime": "2025-07-07T11:55:22.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:20.448Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Elon Musk is threatening to upend politics in the U.S. with a brand new party. Would you ever consider voting for third-party candidates? • No ...\n[https://static.seekingalpha.com/uploads/2018/8/23/sa_logo_dark.png] Read in Browser\n[https://static.seekingalpha.com/uploads/2020/7/8/wsb_podcast_logo_gray_116px_desk_v2.png]\n\nOutlook\nSurvey Monday\nElon Musk is threatening to upend politics in the U.S. with a brand new party. Would you ever consider voting for third-party candidates?\n\n• No (duopoly is enshrined in the U.S. and a waste of a vote)\n• Yes (change can happen, especially in the current environment)\n\nTake the survey here and don't forget to share your thoughts in the WSB comments section.\n[https://static.seekingalpha.com/uploads/2024/4/10/tws_email.png] [https://static.seekingalpha.com/uploads/2020/7/7/social_icon_linkedin.png] [https://static.seekingalpha.com/uploads/2020/7/7/social_icon_facebook.png]\nTop News\nBusiness and politics\n[https://static.seekingalpha.com/cdn/s3/uploads/getty_images/2217854516/image_2217854516.jpg?io=getty-c-w630]\nGetty Images\n\n\"Back to spending 24/7 at work and sleeping in conference/server/factory rooms,\" Elon Musk posted only a month ago, before exiting the Department of Government Efficiency and getting in a high-profile clash with President Trump. \"I must be super focused on X/xAI and Tesla (plus Starship), as we have critical technologies rolling out.\" However, it didn't take long for Musk to get back into the political arena, unveiling the \"America Party\" over the July 4th holiday weekend to \"give you back your freedom.\" See Trump's reaction\n\nMission critical? The catalyst for the formation of the America Party was the \"Big Beautiful Bill,\" which was the final straw in the relationship between Musk and the GOP. The Tesla (TSLA) CEO spent nearly $300M to help Trump get into office, but that backfired when the bill went against his role at DOGE. More importantly, it erased the hefty EV tax credits that have been a major driver of profits for the carmaker (worth $2.8B in 2024) as it faces steep competition and slowing sales. Like many other companies, favorable regulation has been key to the rise of Tesla (TSLA), making it crucial to obtain favorable legislation in areas like clean energy, robotics, self-driving vehicles and AI. Azoria Partners delays Tesla ETF launch\n\nWhile reducing the debt and responsible spending lay the foundation of the new America Party, there is also a growing shift toward ideological polarization among Democrats and Republicans. That might make it easier to court the many voters who currently define themselves as \"politically homeless\" and are looking for new alternatives. Musk has not only threatened to oust every member of Congress that voted for Trump's bill, but has reposted about his new party's foundational priorities of \"free speech, less regulation, pro-tech modernization, and centrist policies everywhere else.\" Will Tesla's board get involved?\n\nWhat it means: While Musk may see this as a lifeline for his companies like SpaceX, Starlink, and most prominently Tesla (TSLA), shareholders are not digesting it that way (at least for the time being). \"Very simply, Musk diving deeper into politics and now trying to take on the Beltway establishment is exactly the opposite direction that Tesla investors/shareholders want him to take during this crucial period for the Tesla story,\" Wedbush's Dan Ives wrote in a research note. Following the news, the EV maker's stock opened down 7% in premarket trading on Monday and has lost 22% in value since the start of the year, making Tesla (TSLA) the worst performer among the \"Magnificent Seven.\" Take the WSB survey.\n\n[https://static.seekingalpha.com/uploads/2024/4/10/tws_email.png] [https://static.seekingalpha.com/uploads/2020/7/7/social_icon_linkedin.png] [https://static.seekingalpha.com/uploads/2020/7/7/social_icon_facebook.png]\nHere's the latest Seeking Alpha analysis\nS&P 500: The Melt-Up Stage, Bust Approaching\n\nMy Biggest New Investment For H2 2025: Blue Owl Capital\n\nI Am Feasting On These Bargain Dividends; Up To 9% Yields\n\nLawmakers Just Accidentally Made Alphabet Irresistibly Attractive\n\n5 Stocks I'm Buying As The 'Big Beautiful Bill' Pushes The Market To New Highs\nWhat else is happening...\nSA Sentiment: One Fed rate cut in view for the year.\n\nJurassic World Rebirth stomps to the top of the box office.\n\nStartups race to help brands navigate AI-powered search.\n\nSA Asks: What's the most attractive AI stock right now?\n\nOil dips as OPEC+ supply hike raises glut concerns.\n\nU.S. tariffs to take effect on Aug. 1 as trading partners scramble.\n\nThreat to countries aligning with 'anti-American policies of BRICS.'\n\nDeal discussions begin for TikTok: U.S.-specific app?\n\nAmazon and Walmart launch dueling sales events this week.\n\nWhat to know about Texas flash floods as death toll crosses 80.\nToday's Markets\nIn Asia, Japan -0.6%. Hong Kong -0.1%. China flat. India flat.\nIn Europe, at midday, London +0.1%. Paris +0.3%. Frankfurt +0.7%.\nFutures at 7:00, Dow -0.1%. S&P -0.3%. Nasdaq -0.4%. Crude flat at $67.01. Gold -1% to $3,310.10. Bitcoin +0.7% to $108,725.\nTen-year Treasury Yield +1 bp to 4.36%.\nOn The Calendar\n\nSee the full earnings calendar on Seeking Alpha, as well as today's economic calendar.\n\nSeeking Alpha’s Wall Street Breakfast Podcast\n[https://email-hs.seekingalpha.com/hs-fs/hubfs/raw_assets/public/seeking_alpha/WSB/assets/apple_large_round.png?width=340&upscale=true&name=apple_large_round.png] [https://email-hs.seekingalpha.com/hs-fs/hubfs/raw_assets/public/seeking_alpha/WSB/assets/apple_logo.png?width=100&upscale=true&name=apple_logo.png] [https://email-hs.seekingalpha.com/hs-fs/hubfs/raw_assets/public/seeking_alpha/WSB/assets/spotify_large_round.png?width=340&upscale=true&name=spotify_large_round.png] [https://email-hs.seekingalpha.com/hs-fs/hubfs/raw_assets/public/seeking_alpha/WSB/assets/spotify_logo.png?width=100&upscale=true&name=spotify_logo.png]\nSeeking Alpha's Wall Street Breakfast podcast brings you all the news you need to know for your market day. Released by 8:00 AM ET each morning, it is a quick listen that you can put on as you get ready to start your working day.\n\nDownload Seeking Alpha for your Phone or Tablet\n\n[https://static.seekingalpha.com/uploads/2020/4/20/apple_appstore.png] [https://static.seekingalpha.com/uploads/2020/4/20/android_appstore.png]\n\nWant More Ideas?\n\nOur best ideas → Stock Ideas\nETF's Investing Ideas → ETF Ideas\nDividend stocks ideas → Dividend Ideas\n\nLike Wall Street Breakfast? Try our other newsletters as well.\nThis email was sent to you because you signed up to receive Wall Street Breakfast.\nIf you do not want to receive Wall Street Breakfast emails, click here to unsubscribe.\n\nPast performance is no guarantee of future results. Any content and tools on the platform are offered for information purposes only. No recommendation or advice is being given as to whether any investment is suitable for a particular investor. Any views or opinions expressed may not reflect those of Seeking Alpha as a whole. Analysts and Investing Group Leaders are third-party authors that include both professional investors and individual investors who may not be licensed or certified by any institute or regulatory body. Seeking Alpha does not take account of your objectives or your financial situation and does not offer any personalized investment advice. Seeking Alpha is not a licensed securities dealer, broker or US investment adviser or investment bank.\n\nSent by Seeking Alpha, 244 5th Ave, Suite 2705, New York, NY 10001\n250862927074 https://email-hs.seekingalpha.com/hs/preferences-center/en/page?data=W2nVjwf3Y2wWTW3_MNWF4ffWPgW36y3lw1SjpRyW38yQb22HqPgcW1QmwTv3gxNdvW4crKys3DZ73DW1NvSL-2p9_pNW3Hc59R38j0h1W3gbTpy30nyglW22VYXx4fzCBzW1BnnnS1ZkxmrW3P8KVS34pVSMW3g2rF21Zg8G9W2FsJqs4cLWYBW3_sYKb2WqndJW1LpC-32vXCPrW2YMWJC1ZkYMHW3DYd412xxHy8W2RV14C3NNxlRW3XyYTG3SCpR9W1BCPC125jF_PW2y3RFy4pnD49W38gPVW34yMMTW325lY14fh5M-W3SZ_ZZ38tb2GW253ksG32b0_dW3G-_vm3ddf1hW3b4zvF1LqQCgW45vnsL3NN8vZW367rDW3Zx3x_W1QcfmZ22WmckW2WKDh91X9mYTW2WtnRF2qSZb6W25dT0T4hg3GpW3C6RtD1LwVkdW3SQd3y49D2R0W2TpSmv2MDgzSW2-BB5y3SBbkqW4tnbBh22VWFKW2YsNFv47T76lW3z1g47217sSjW3T6drY1Skh8nW1NdJx74ffxxnW3DL27r2-w0ZPW219C1n1ShDw_W2Rs6t42WQFDYW2zHnpN4mDHvzW1BnNKW34x6lt0",
+            "body_hash": "154ec637869dd9d6b6d8c044a31871755b8ada65d9af6428030ae2b4c8bbc763",
+            "tokens_est": 2074,
+            "body_truncated": false,
+            "body_chars": 8294,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOfoW1RAABErAPl96N2RbTL607yO--6AAQvRjDFAAA=",
+            "internet_message_id": "<8F.57.57593.E1CAB686@i-05026995f9e87297d.mta1vrest.sd.prd.sparkpost>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOfoW1RAAA=",
+            "subject": "Deadly floods in Texas",
+            "from_domain": "news.bloomberg.com",
+            "from_address": "noreply@news.bloomberg.com",
+            "body_preview": "Bloomberg Morning Briefing Americas\r\nView in browser\r\n\r\n\r\n\r\n\r\n\r\nGood morning. Catastrophic flooding kills more than 80 people in Texas. Donald Trump dials up trade tensions. And Jurassic World Rebirth roars to the top of the box office. Listen to the day’",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 81395,
+            "received_datetime": "2025-07-07T11:14:57.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:20.999Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Bloomberg Morning Briefing Americas\nView in browser\n[Bloomberg]\n[https://sli.bloomberg.com/imp?s=1148999&li=14130440&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=static]\n[https://sli.bloomberg.com/imp?s=1148999&li=14130440&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=desktop&collapse_width=550]\n[https://sli.bloomberg.com/imp?s=1148999&li=14130440&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=mobile&collapse_width=550]\n\nGood morning. Catastrophic flooding kills more than 80 people in Texas. Donald Trump dials up trade tensions. And Jurassic World Rebirth roars to the top of the box office. Listen to the day’s top stories.\n\nMarkets Snapshot\nS&P 500 Index Futures 6,306 -0.29%\nNasdaq 100 Index Futures 22,963.5 -0.43%\nBloomberg Dollar Spot Index 1,195.91 +0.43%\nMarket data as of 07:12 am EST. View or Create your Watchlist\nMarket data may be delayed depending on provider agreements.\n\nTexas’s catastrophic flooding killed at least 82 people, with scores still missing after torrential rains and floods devastated an all-girls summer camp in Kerrville. The area remains at risk of further inundation and forecasters extended a flood watch into Monday evening. Some politicians have already raised questions over the accuracy of weather forecasts and the possible role of staffing cuts at the National Weather Service for the disaster.\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iXIhzTcja0gI/v0/-1x-1.jpg]\nSearch and rescue workers dig through debris following the flash flooding in Hunt, Texas. Photographer: Jim Vondruska/Getty Images\n\nTrade latest. Donald Trump said that any country aligning with the “anti-American” policies of the BRICS group of countries that includes Brazil, Russia, India, China and South Africa will face an additional 10% tariff. The warning comes as the US prepares to send letters to 12-15 countries today setting out their new tariff levels. Treasury Secretary Scott Bessent indicated some nations may be given an extension to finalize agreements.\n\nStocks retreated and the dollar gained in a risk-averse start to the week. Trade tensions are back in focus as investors await outcomes from tariff negotiations ahead of the July 9 deadline. Read our explainer on what is Trump’s tariff campaign meant to achieve.\n\nThe feud between Trump and Elon Musk escalated as the Tesla CEO formed a new “America Party” and hinted it may even back a presidential candidate. Trump was quick to hit back, deriding the effort as “ridiculous.” It was yet more bad news for Tesla shares, with Wedbush analyst Daniel Ives calling Musk’s move “exactly the opposite” of what investors want, at time when Tesla faces plenty of troubles.\n\nIn corporate news, Apple appealed a $580 million fine from the European Union, calling the penalty “unprecedented” and the regulator’s required changes to its App Store as “unlawful.” Meanwhile, TikTok is developing a new version of its app for US users ahead of a planned sale, The Information reported.\n\nBloomberg Green Seattle: Join us July 14-16 for two days of compelling conversations where we’ll explore the urgent environmental challenges of today and the innovative ideas shaping tomorrow. Featured speakers include Ryan Gellert, CEO of Patagonia, Academy Award-winning actor Jane Fonda and many more. Click here for details.\n\n[https://sli.bloomberg.com/imp?s=1099764&stpe=default&li_coord=desktop&collapse_width=550&li=14130440&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\n[https://sli.bloomberg.com/imp?s=1099764&stpe=default&li_coord=mobile&collapse_width=550&li=14130440&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\nDeep Dive: Small-Cap Warning\n\nWarning lights are blinking across US equities and there may be trouble ahead for the recent rebound in some of the riskiest stocks.\n\n* As the S&P 500 Index hit record highs, shares of small-cap companies—which often carry a higher debt load and are less profitable—surged even more, fueled by speculative bets.\n* Those came after two of Wall Street’s major trading desks made the same bold call: Pile into this year’s biggest losers for quick, short-term profits—particularly smaller companies.\n* But the peak may be near. Bloomberg Intelligence says its gauge of investor sentiment has swung from panic mode in April to “approaching manic” in June, a level where markets tend to cool off and smaller stocks start to trail larger ones.\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/izEpb0lU10s8/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\n\nSubscribe to Stock Movers, your 5-minute podcast on the winners and losers of each trading day.\n\nThe Big Take\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iCiBprnzZkW4/v0/-1x-1.jpg]\nA cluster of trading giants operate out of a large curved tower called Two Horizon Center in Gurugram, India. Photographer: Elke Scholiers/Bloomberg\n\nIndia’s high-frequency trading bonanza saw global firms make outsized profits for years. Now, a crackdown on Jane Street suggests the windfall may be coming to an end.\n\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/irMibStcq.U8/v3/pidjEfPlU1QWZop3vfGKsrX.ke8XuWirGYh1PKgEw44kE/-1x-1.png]\nOpinion\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/icxz_3CiKjiA/v0/-1x-1.jpg]\nSource: Bloomberg\n\nIt’s far less sexy than a Lamborghini, but the next must-have accessory for crypto and tech bros is a banking license, Paul J. Davies writes. It’s a risky one and experts warn that these new banks could repeat the mistakes of past failures such as Silvergate and Signature.\n\nMore Opinions\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/igSUFkQe1PcA/v0/129x86.jpg]\nJohn Authers and Richard Abbey\nIs the Dollar Resting, or Nailed to Its Perch?\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/ihQEhKAjqkPE/v1/129x86.jpg]\nCatherine Thorbecke\nWe’re Losing the Plot on AI in Universities\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iPVudRR6uMog/v1/129x86.jpg]\nPatricia Lopez\nICE Doesn't Need Another $100 Billion\nBefore You Go\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iF1qIaC7FIk4/v0/-1x-1.jpg]\nSource: Universal Pictures\n\nRoaring to the top. Jurassic World Rebirth, the latest installment of the Universal Pictures dinosaur franchise, scored the top spot in theaters over the Fourth of July holiday, grossing $147.3 million in the US and Canada despite not exactly rave reviews from critics.\n\nA Few More\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iwmlAZgGc3m4/v1/129x86.jpg]\nAre You Ready for Slushy Summer?\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iEoUgNwiYftw/v2/129x86.jpg]\nHow Xiaomi Succeeded Where Apple Failed\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iFBWyFyIA4cg/v0/129x86.jpg]\nAre Tourists Ruining Europe? How Locals Are Pushing Back\n\nCheck out our new weekly Business of Food newsletter for everything you need to know on how the world feeds itself, from farming to supply chains to consumer trends.\n\nMore From Bloomberg\n\nEnjoying Morning Briefing Americas? Get more news and analysis with our regional editions for Asia and Europe. Check out these newsletters, too:\n\n* Markets Daily for what’s moving in stocks, bonds, FX and commodities\n* Breaking News Alerts for the biggest stories from around the world, delivered to your inbox as they happen\n* Supply Lines for daily insights into supply chains and global trade\n* FOIA Files for Jason Leopold’s weekly newsletter uncovering government documents never seen before\n\nExplore all newsletters at Bloomberg.com.\n\nFollow Us\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i7G4HOaCfw0A/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iDRduxloBOSA/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i5QE5__h22bE/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iiSKUb3JWcLI/v0/-1x-1.png]\n\nLike getting this newsletter? Subscribe to Bloomberg.com for unlimited access to trusted, data-driven journalism and subscriber-only insights.\n\nBefore it’s here, it’s on the Bloomberg Terminal. Find out more about how the Terminal delivers information and analysis that financial professionals can’t find anywhere else. Learn more.\n\nWant to sponsor this newsletter? Get in touch here.\n\nYou received this message because you are subscribed to Bloomberg's Morning Briefing: Americas newsletter. If a friend forwarded you this message, sign up here to get it in your inbox.\nUnsubscribe\nBloomberg.com\nContact Us Bloomberg L.P.\n731 Lexington Avenue,\nNew York, NY 10022\n[Ads Powered By Liveintent] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i84ASdYMF2Xk/v0/-1x-1.png] [Ad Choices]",
+            "body_hash": "f2d76f5cc282eda08d2dfb8a80c9b5ed23f740cb44f619a9e45b13f9743ffd1c",
+            "tokens_est": 2198,
+            "body_truncated": false,
+            "body_chars": 8790,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOfoW1RAABErAPl96N2RbTL607yO--6AAQvRjDEAAA=",
+            "internet_message_id": "<14.AF.03514.28AAB686@i-0f41df02429c88434.mta1vrest.sd.prd.sparkpost>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOfoW1RAAA=",
+            "subject": "Amazon's AI underwhelms",
+            "from_domain": "news.bloomberg.com",
+            "from_address": "noreply@news.bloomberg.com",
+            "body_preview": "Hi, you’re receiving our free Tech In Brief newsletter because you had been getting one of Bloomberg’s technology newsletters that are now s\r\n\r\n\r\n\r\n\r\n\r\nGet exclusive scoops, insights and analysis from Bloomberg technology reporters with the Tech Newslette",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 39185,
+            "received_datetime": "2025-07-07T11:08:20.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:21.535Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Hi, you’re receiving our free Tech In Brief newsletter because you had been getting one of Bloomberg’s technology newsletters that are now s\n[Bloomberg]\n[https://sli.bloomberg.com/imp?s=1149024&li=14130387&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=static]\n[https://sli.bloomberg.com/imp?s=1149024&li=14130387&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=desktop&collapse_width=550]\n[https://sli.bloomberg.com/imp?s=1149024&li=14130387&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=mobile&collapse_width=550]\n\nGet exclusive scoops, insights and analysis from Bloomberg technology reporters with the Tech Newsletter Bundle subscription. Includes the subscriber-only newsletters Tech In Depth, Power On, Q&AI, Game On and Soundbite and paywall-free access to the links in them.\nSubscribe now\n\nHi, you’re receiving our free Tech In Brief newsletter because you had been getting one of Bloomberg’s technology newsletters that are now subscriber-only. You can manage your subscriptions here.\n\nTech Across the Globe\n\nInternet blackouts: Russia is regularly switching off mobile internet connections in large swaths of the country for security reasons. There were a record 654 mobile data shutdowns in regions across the country in June, hitting banking apps, delivery services and taxi networks.\n\nHon Hai thriving: Anyone expecting evidence of an AI spending slowdown will again have been disappointed over the weekend. AI server maker Hon Hai reported 16% sales growth and met estimates in the June quarter.\n\nSearch compromise: Google will propose highlighting search results from rivals’ shopping and travel platforms in an attempt to comply with the EU’s Digital Markets Act and fend off fines.\n\nRelated Stories\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iljEp1eLL06w/v0/129x86.jpg]\nLG Electronics Misses Estimates on Tariffs, Consumer Sentiment\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iJEPn.jwLByA/v1/129x86.jpg]\nItaly’s Bridge to Nowhere Shows Defense-Boom Risks\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i5oZezV_QrjY/v0/129x86.jpg]\nTrump Threatens 10% Tariff for ‘Anti-American’ BRICS Policies\nRevalued\n\nShares in Beijing-based Xiaomi Corp. have more than tripled over the past year, as founder Lei Jun’s bold foray into EVs starts to pay off. Bloomberg’s Linda Lew takes a closer look at how the maker of smartphones, luggage and rice cookers succeeded where Apple failed.\n\nMust Read\n\nAmazon is preparing to unfurl another round of discounts for its July Prime Day event, which will also mark the first birthday of its AI shopping assistant, Rufus. Bloomberg’s Austin Carr gave a fresh try to the tool, which is heavily promoted by the online emporium operator, but the results were not much better than on its debut a year earlier. Read today’s Tech In Depth essay for the full review.\n\n[https://sli.bloomberg.com/imp?s=1105644&stpe=default&li_coord=desktop&collapse_width=550&li=14130387&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\n[https://sli.bloomberg.com/imp?s=1105644&stpe=default&li_coord=mobile&collapse_width=550&li=14130387&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\nMore from Bloomberg\n\nGet Tech In Depth and more Bloomberg Tech newsletters in your inbox:\n\n* Cyber Bulletin for coverage of the shadow world of hackers and cyber-espionage\n* Game On for diving deep inside the video game business\n* Power On for Apple scoops, consumer tech news and more\n* Screentime for a front-row seat to the collision of Hollywood and Silicon Valley\n* Soundbite for reporting on podcasting, the music industry and audio trends\n* Q&AI for answers to all your questions about AI\n\nFollow Us\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iDRduxloBOSA/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i5QE5__h22bE/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iiSKUb3JWcLI/v0/-1x-1.png]\n\nLike getting this newsletter? Subscribe to Bloomberg.com for unlimited access to trusted, data-driven journalism and subscriber-only insights.\n\nBefore it’s here, it’s on the Bloomberg Terminal. Find out more about how the Terminal delivers information and analysis that financial professionals can’t find anywhere else. Learn more.\n\nWant to sponsor this newsletter? Get in touch here.\n\nYou received this message because you are subscribed to Bloomberg's Tech In Brief newsletter. If a friend forwarded you this message, sign up here to get it in your inbox.\nUnsubscribe\nBloomberg.com\nContact Us Bloomberg L.P.\n731 Lexington Avenue,\nNew York, NY 10022\n[Ads Powered By Liveintent] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i84ASdYMF2Xk/v0/-1x-1.png] [Ad Choices]",
+            "body_hash": "1986c15b92fb3611e1b54f7c4c5d3fe6fb4bc5b9bfec28e63b810c226731f116",
+            "tokens_est": 1221,
+            "body_truncated": false,
+            "body_chars": 4881,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOfoW1RAABErAPl96N2RbTL607yO--6AAQvRjDDAAA=",
+            "internet_message_id": "<C2.91.43814.A3AAB686@i-03264b5a98e52f431.mta1vrest.sd.prd.sparkpost>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOfoW1RAAA=",
+            "subject": "Amazon's immature assistant",
+            "from_domain": "news.bloomberg.com",
+            "from_address": "noreply@news.bloomberg.com",
+            "body_preview": "Welcome to Tech In Depth, our daily newsletter about the business of tech from Bloomberg’s journalists around the world. Today, Austin Carr\r\nView in browser\r\n\r\n\r\n\r\n\r\n\r\nWelcome to Tech In Depth, our daily newsletter about the business of tech from Bloomber",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 54390,
+            "received_datetime": "2025-07-07T11:06:41.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:22.080Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Welcome to Tech In Depth, our daily newsletter about the business of tech from Bloomberg’s journalists around the world. Today, Austin Carr\nView in browser\n[Bloomberg]\n[https://sli.bloomberg.com/imp?s=1149054&li=14130377&m=c4f4565a96e8de530274e4b2a295c481&p=07072025&lctg=03e8246f-c534-4728-b6cd-e855992fdc90&stpe=static]\n[https://sli.bloomberg.com/imp?s=1149054&li=14130377&m=c4f4565a96e8de530274e4b2a295c481&p=07072025&lctg=03e8246f-c534-4728-b6cd-e855992fdc90&stpe=default&li_coord=desktop&collapse_width=550]\n[https://sli.bloomberg.com/imp?s=1149054&li=14130377&m=c4f4565a96e8de530274e4b2a295c481&p=07072025&lctg=03e8246f-c534-4728-b6cd-e855992fdc90&stpe=default&li_coord=mobile&collapse_width=550]\n\nWelcome to Tech In Depth, our daily newsletter about the business of tech from Bloomberg’s journalists around the world. Today, Austin Carr looks at the performance of Amazon’s shopping bot, Rufus.\n\nTech Across the Globe\n\nInternet blackouts: Russia is regularly switching off mobile internet connections in large swaths of the country for security reasons. There were a record 654 mobile data shutdowns in regions across the country in June, hitting banking apps, delivery services and taxi networks.\n\nHon Hai thriving: Anyone expecting evidence of an AI spending slowdown will again have been disappointed over the weekend. AI server maker Hon Hai reported 16% sales growth and met estimates in the June quarter.\n\nSearch compromise: Google will propose highlighting search results from rivals’ shopping and travel platforms in an attempt to comply with the EU’s Digital Markets Act and fend off fines.\n\nRevalued\n\nShares in Beijing-based Xiaomi Corp. have more than tripled over the past year, as founder Lei Jun’s bold foray into EVs starts to pay off. Bloomberg’s Linda Lew takes a closer look at how the maker of smartphones, luggage and rice cookers succeeded where Apple failed.\n\nMore practice required\n\nAmazon.com Inc.’s big Prime Day summer sale kicks off Tuesday. The annual shopping extravaganza attracts millions of consumers to hunt for discounts worth billions of dollars, an opportunity for the world’s largest online retailer to promote its massive inventory of products. But this year’s deals event is also a chance for Amazon to promote one in-house product in particular: its Rufus chatbot.\n\nThe artificial intelligence-powered shopping assistant rolled out to all US customers just days before last July’s Prime Day sale. A sort of ChatGPT specifically geared for surfing Amazon’s web store, Rufus wasn’t quite ready. Early adopters found its responses stilted and performance underwhelming, another reminder of Amazon’s (and Alexa’s) lagging AI efforts. Will second impressions of Rufus fare any better this go-around?\n\nAmazon is certainly banking on that, judging from how much attention it continues to give the shopping bot. It has been promoting Rufus and its other AI tools as core to helping users scan through product recommendations, pricing and reviews for this 2025 Prime Day.\n\nThe button for opening a chat with Rufus appears prominently at the top left of Amazon’s home page and as a colorful icon in its mobile app alongside your shopping cart. Typing into the traditional search bar now frequently returns suggestions for questions to ask Rufus instead.\n\nThe hope is that AI can make e-commerce searches way faster and more sophisticated. It’s a complex engineering challenge, especially given the scale at which Amazon operates: During Prime Day 2024, the Amazon Web Services team recently revealed that its computer infrastructure was “handling millions of queries per minute and generating billions of tokens in real-time” via Rufus. AWS leaders said their goal was to deliver AI responses in less than 0.3 seconds — potentially server-melting speeds.\n\nSince then, Rufus’ conversational abilities have improved and it’s become better at delivering personalized results. But, at least in my experience, it’s a long way off from a habit-forming bit of extra help.\n\nOften, I’ve found Rufus either provides overly confident answers to my questions or surfaces too many results in its tiny chat window. Amazon’s traditional search engine, with its larger results page and sidebar of manual filters, still feels more efficient. That’s a major problem when the bot is supposed to hasten us out of that archaic age of manual search.\n\nAnother issue is that Rufus seems to be jarringly dependent on specific keywords or phrases to function properly. It randomly refuses to provide answers to certain questions or, worse, provides random answers to other requests.\n\nFor example, when I asked it for the best upcoming Prime Day deals based on my shopping history, Rufus inexplicably told me the delivery status of several past orders. Only when I asked the question in a certain way that Amazon recommends (“What Prime Day deals should I shop?”) did Rufus provide a relevant reply, and even then, its ideas weren’t totally inspiring. For example, Rufus highlighted a generic $20 Amazon Essentials Oxford Shirt marked down to $17. Hmph.\n\nMore promising is how Rufus auto-summarizes customer reviews. Rather than having to sift through multiple pages of reviews to assess, say, the reliability of a kitchen blender or compatibility of a phone charger, Rufus identifies the pertinent info and can synthesize other data to answer more of your questions. It’s still hit or miss — when I asked recently if a particular dog seat cover would fit in my Subaru, Rufus said it would surely fit in a Maserati — but I’ve generally found these summations super helpful versus the old system.\n\nUltimately, Amazon is betting on Rufus to increase “downstream impact,” a controversial metric the company uses to measure indirect revenue gains from its services. Which, in this case, might mean Rufus boosting business through an influx of shopping traffic, targeted ads, voice-enabled purchases or even AI agents that can do the buying for you.\n\nFor me to ever rely on Rufus to take over my shopping from start to finish, it’ll need to build a more robust profile of my preference, because a Maserati driver who buys Essentials shirts just isn’t me.\n\n[https://sli.bloomberg.com/imp?s=868522&stpe=default&li_coord=desktop&collapse_width=550&li=14130377&m=c4f4565a96e8de530274e4b2a295c481&p=07072025&lctg=03e8246f-c534-4728-b6cd-e855992fdc90]\n[https://sli.bloomberg.com/imp?s=868522&stpe=default&li_coord=mobile&collapse_width=550&li=14130377&m=c4f4565a96e8de530274e4b2a295c481&p=07072025&lctg=03e8246f-c534-4728-b6cd-e855992fdc90]\nQuoted\n“Every chance I get to tell them to scrub their socials even for likes and reposts of innocuous content, I do.”\nGenie Doi\nImmigration lawyer\nDoi works with online influencers and is among the lawyers increasingly advising US-based content creators who aren't citizens to steer clear of hot-button topics, as an immigration crackdown spreads across the country.\nRead\nThe day’s most read story in tech and entertainment\n\nMajor US trading partners hurried over the weekend to secure trade deals or lobby for extra time, while Treasury Secretary Scott Bessent indicated that some countries lacking an agreement by the deadline Wednesday will have the option of a three-week extension to negotiate. Chip export-led economies like South Korea and Taiwan are trying to secure sustainable terms to minimize disruption for their national champions.\n\nMoved\n35%\nShares in medical equipment and industrial printer maker Seiko Epson Corp. are down by more than a third since the start of the year. The company has key production facilities at home in Japan, making it one of the hardest-hit by US tariffs.\nAV Club\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i_PiiaRE93QY/v0/-1x-1.jpg]\n\nUS President Donald Trump threatened he’d impose an additional 10% tariff on any country aligning itself with “the Anti-American policies of BRICS,” injecting further uncertainty into global trade.\n\nMore from Bloomberg\n\nGet Tech In Depth and more Bloomberg Tech newsletters in your inbox:\n\n* Cyber Bulletin for coverage of the shadow world of hackers and cyber-espionage\n* Game On for diving deep inside the video game business\n* Power On for Apple scoops, consumer tech news and more\n* Screentime for a front-row seat to the collision of Hollywood and Silicon Valley\n* Soundbite for reporting on podcasting, the music industry and audio trends\n* Q&AI for answers to all your questions about AI\n\nFollow Us\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iDRduxloBOSA/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i5QE5__h22bE/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iiSKUb3JWcLI/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i_JvbwNnmprk/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iXt_II64P_EM/v0/-1x-1.png]\n\nLike getting this newsletter? There’s more where that came from. Browse all our weekly and daily emails to get even more insights from your Bloomberg.com subscription.\n\nBefore it’s here, it’s on the Bloomberg Terminal. Find out more about how the Terminal delivers information and analysis that financial professionals can’t find anywhere else. Learn more.\n\nWant to sponsor this newsletter? Get in touch here.\n\nYou received this message because you are subscribed to Bloomberg's Tech In Depth newsletter. If a friend forwarded you this message, sign up here to get it in your inbox.\nUnsubscribe\nBloomberg.com\nContact Us Bloomberg L.P.\n731 Lexington Avenue,\nNew York, NY 10022\n[Ads Powered By Liveintent] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i84ASdYMF2Xk/v0/-1x-1.png] [Ad Choices]",
+            "body_hash": "959d065e3c323edb84d3f03059d7dac320c2c58457f875901ebca8281c7b4d35",
+            "tokens_est": 2403,
+            "body_truncated": false,
+            "body_chars": 9611,
+            "max_body_chars": 100000
+          },
+          {
+            "user_upn": "jouni.pappila@repoxcapital.fi",
+            "message_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgBGAAAAAAB34joJCMvcSICl8aIUP6GVBwBErAPl96N2RbTL607yO--6AAOfoW1RAABErAPl96N2RbTL607yO--6AAQvRjDCAAA=",
+            "internet_message_id": "<5B.41.63152.ACA9B686@i-084eae0c069232be8.mta1vrest.sd.prd.sparkpost>",
+            "folder_id": "AAMkADY3N2JlYjE1LWIwZTYtNDQyNC04ODcxLTA0MGQ5NzIxOGFmMgAuAAAAAAB34joJCMvcSICl8aIUP6GVAQBErAPl96N2RbTL607yO--6AAOfoW1RAAA=",
+            "subject": "What causes red wine headaches",
+            "from_domain": "news.bloomberg.com",
+            "from_address": "noreply@news.bloomberg.com",
+            "body_preview": "Cheap ones might be safer.\r\nView in browser\r\n\r\n\r\n\r\n\r\n\r\nPrognosis is exclusively for Bloomberg.com subscribers. As a loyal reader, you’re receiving a complimentary trial. If you’d like to continue receiving Prognosis, and gain unlimited digital access to a",
+            "has_body": true,
+            "body_content_type": "text",
+            "body_size_bytes": 35577,
+            "received_datetime": "2025-07-07T10:01:05.000Z",
+            "needs_body": false,
+            "analyzed_at": null,
+            "created_at": "2025-10-08T13:04:22.648Z",
+            "body_source": "db",
+            "content_len": 0,
+            "content_hash": null,
+            "body_text": "Cheap ones might be safer.\nView in browser\n[Bloomberg]\n[https://sli.bloomberg.com/imp?s=1149064&li=14129288&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=static]\n[https://sli.bloomberg.com/imp?s=1149064&li=14129288&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=desktop&collapse_width=550]\n[https://sli.bloomberg.com/imp?s=1149064&li=14129288&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f&stpe=default&li_coord=mobile&collapse_width=550]\n\nPrognosis is exclusively for Bloomberg.com subscribers. As a loyal reader, you’re receiving a complimentary trial. If you’d like to continue receiving Prognosis, and gain unlimited digital access to all of Bloomberg.com, we invite you to subscribe now at the special rate of $149 for your first year (usually $299).\nLearn more\n\nHi! It’s Madison in New York. Have scientists found the culprit behind those pesky red wine-induced headaches? More on that in a moment ...\n\nToday’s must-reads\n\n* Soot from Canadian wildfires risks making the Arctic melt faster.\n* China has hit back at the EU’s restrictions on its medical device makers.\n* When an HIV scientific breakthrough isn’t enough.\n\nSunscreen for grapes\n\nWithin minutes of drinking a glass of pinot, I can feel my cheeks flushing. It’s not long before the dreaded red wine headache sets in. I’ve always wondered why red wine seems to affect me more than other types of alcohol — and I’m not the only one.\n\nI’ve heard tons of theories over the years: Perhaps preservatives like sulfites are to blame? Or maybe it’s histamines, naturally occurring compounds that are found in some food and beverages? Could it be tannins, the plant chemicals responsible for giving red wine its flavor?\n\nMore recently, signs have pointed to another culprit: a chemical called quercetin that’s produced by red grapes as they’re exposed to sunlight. “It’s sunscreen for grapes,” says Andy Waterhouse, a wine chemist at UC Davis.\n\nWhite wine also contains quercetin, but usually at much lower levels. It can be difficult for wine buyers to easily find levels of quercetin in both red and white wines, because they’re not regularly tested for it. Waterhouse said it’s not uniform or consistent even among wine varietals, since its dependent on sun exposure.\n\nWaterhouse and his collaborators have found that the quercetin in red wine inhibits the body’s ability to fully break down alcohol. That leads to a buildup of acetaldehyde, the toxic byproduct of alcohol that’s also through to be one of the main drivers of headaches and other hangover symptoms. Acetaldehyde is metabolized in the liver and the gut, and small amounts typically aren’t harmful. But when it’s allowed to accumulate, it can be toxic.\n\nSome people actually lack the enzyme responsible for quickly breaking down acetaldehyde, which can lead to symptoms of alcohol intolerance. People of East Asian descent, for example, are more likely to have a genetic mutation that limits this enzyme’s ability to rid the body of acetaldehyde, which can make them more sensitive to alcohol’s effects.\n\nMore research is needed to determine whether quercetin really is responsible for the dreaded red wine headache. Waterhouse says he hopes to run a study in people who are prone to these headaches, testing their reactions to wines that are higher or lower in quercetin. It’s well known, he says, that some wines have higher amounts of the chemical.\n\nIn fact, Waterhouse’s research has also found that the amount of quercetin in wine tends to increase with price. More than two decades ago, he conducted a study on the 20 best selling cabernets in California. The most expensive cabs on the list had about four times as much quercetin than the average ones.\n\nThat’s because higher-quality wines tend to be made from grapes with carefully controlled sun exposure. Lower-quality wines, on the other hand, are usually made from large vines that have more shade for the grapes, Waterhouse said.\n\nSo, the good news for people who suffer from red wine headaches: Cheaper wine may actually be a better choice. — Madison Muller\n\n[https://sli.bloomberg.com/imp?s=868577&stpe=default&li_coord=desktop&collapse_width=550&li=14129288&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\n[https://sli.bloomberg.com/imp?s=868577&stpe=default&li_coord=mobile&collapse_width=550&li=14129288&m=2c39b2fbe680d7e7521399c9ad7717a6&p=07072025&lctg=dabd4d74-e1b5-4dba-a70a-4e5f4051725f]\nWhat we’re reading\n\nWhat Medicaid work requirements will mean for enrollees, according to the Wall Street Journal.\n\nRisks from drinking alcohol increase as you age. The New York Times has the details.\n\nThe man behind the Slim-Fast diet died last month at 100. The Washington Post obituary tells the story of S. Daniel Abraham.\n\nContact Prognosis\n\nHealth questions? Have a tip that we should investigate? Contact us at AskPrognosis@bloomberg.net.\n\nFollow Us\n[https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i7G4HOaCfw0A/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/iDRduxloBOSA/v0/-1x-1.png] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i5QE5__h22bE/v0/-1x-1.png]\n\nLike getting this newsletter? There's more where that came from. Browse all our weekly and daily emails to get even more insights from your Bloomberg.com subscription.\n\nWant to sponsor this newsletter? Get in touch here.\n\nYou received this message because you are subscribed to Bloomberg's Prognosis newsletter. If a friend forwarded you this message, sign up here to get it in your inbox.\nUnsubscribe\nBloomberg.com\nContact Us Bloomberg L.P.\n731 Lexington Avenue,\nNew York, NY 10022\n[Ads Powered By Liveintent] [https://assets.bwbx.io/images/users/iqjWHBFdfxIU/i84ASdYMF2Xk/v0/-1x-1.png] [Ad Choices]",
+            "body_hash": "eed22c64829c6e40c64bef6c9c71fac71b8ad20bf08a830db5376cef3997857a",
+            "tokens_est": 1467,
+            "body_truncated": false,
+            "body_chars": 5866,
+            "max_body_chars": 100000
+          }
+        ],
+        "batch_number": 2,
+        "batch_size": 15,
+        "total_items": 60,
+        "total_batches": 4
+      }
+    ]
+  },
+  "meta": {
+    "instanceId": "5bc588890427261aec904f1de6ea2c47f92f0021d7680fbf9bd2043a6f4924b2"
+  }
+}

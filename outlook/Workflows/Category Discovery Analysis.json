@@ -1,0 +1,298 @@
+{
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1840,
+        -928
+      ],
+      "id": "926f966e-6d90-494a-8f79-1e3cc3c777bc",
+      "name": "Start"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a784475-35c6-4380-87c6-8514dbe1997e",
+              "name": "MIN_SUPPORT_DOMAIN",
+              "value": 8,
+              "type": "number"
+            },
+            {
+              "id": "04b02c9f-87d1-4ec8-b22c-4e55670ef274",
+              "name": "MIN_SUPPORT_ADDR",
+              "value": 4,
+              "type": "number"
+            },
+            {
+              "id": "b6445486-2a56-4379-91df-72f8494d5ddd",
+              "name": "MIN_SUPPORT_HEADER",
+              "value": 6,
+              "type": "number"
+            },
+            {
+              "id": "51b2ad0d-9f9a-4572-a32f-8176f4e2e6f3",
+              "name": "PREC_DOMAIN_MIN_PCT",
+              "value": 90,
+              "type": "number"
+            },
+            {
+              "id": "b94f554b-efff-405f-8f99-d34bea567940",
+              "name": "PREC_ADDR_MIN_PCT",
+              "value": 95,
+              "type": "number"
+            },
+            {
+              "id": "82e3ce19-c6f3-4dea-a93e-80fe58fce7ab",
+              "name": "ACTION_PREC_MIN_PCT",
+              "value": 75,
+              "type": "number"
+            },
+            {
+              "id": "8054bc05-5e8b-4ac4-ae37-17c8bf1191ee",
+              "name": "BORDERLINE_BAND_PCT",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "a178e2a0-1936-464b-9741-d8cbe8bf2b5c",
+              "name": "MAX_RULES",
+              "value": 300,
+              "type": "number"
+            },
+            {
+              "id": "f61c03c1-8cbe-4594-9820-1ca6bbac92d7",
+              "name": "FEATURES",
+              "value": "from_domain,list_domain,unsub_domain,message_id_domain,precedence,auto_submitted,from_address,sender_address,reply_to_address,return_path",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1680,
+        -928
+      ],
+      "id": "5601a3bd-7ce3-4c4b-90da-4a608b95934e",
+      "name": "set_config"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH base AS (\n  SELECT\n    e.message_id,\n    e.subject,\n    LOWER(e.from_domain)                                  AS from_domain,\n    e.list_id,\n    e.unsubscribe_link,\n    e.precedence,\n    e.auto_submitted,\n    e.message_id_header,\n    e.from_address,\n    e.sender_address,\n    e.reply_to_address,\n    e.received_datetime,\n    ei.primary_category,\n    ei.recommended_action,\n    ei.decided_at,\n    COALESCE(ca.business_relevance_score, 0)              AS business_relevance_score\n  FROM outlook.emails_ingest e\n  JOIN outlook.email_interest ei ON ei.message_id = e.message_id\n  LEFT JOIN outlook.content_analysis ca ON ca.message_id = e.message_id\n  LEFT JOIN outlook.email_headers h ON h.message_id = e.message_id\n  WHERE e.is_deleted IS DISTINCT FROM TRUE\n    AND ei.primary_category IS NOT NULL\n), derived AS (\n  SELECT\n    b.*,\n    -- list_id → domain\n    LOWER(NULLIF(REGEXP_REPLACE(b.list_id, '.*<([^>]+)>.*', '\\1'), ''))             AS list_domain,\n    -- unsubscribe → domain (http/mailto)\n    COALESCE(\n      LOWER(NULLIF(REGEXP_REPLACE(b.unsubscribe_link, '.*https?://([^/>,;]+).*', '\\1'), '')),\n      LOWER(NULLIF(REGEXP_REPLACE(b.unsubscribe_link, '.*@([^> ,;]+).*', '\\1'), ''))\n    )                                                                               AS unsub_domain,\n    -- message-id → domain\n    LOWER(NULLIF(REGEXP_REPLACE(b.message_id_header, '.*@([^>]+)>.*', '\\1'), ''))   AS message_id_domain,\n\n    -- from_address normalized (drop +tag)\n    CASE\n      WHEN b.from_address IS NULL THEN NULL\n      WHEN POSITION('@' IN b.from_address) > 0\n        THEN SPLIT_PART(SPLIT_PART(LOWER(b.from_address),'@',1),'+',1) || '@' || LOWER(SPLIT_PART(b.from_address,'@',2))\n      ELSE LOWER(b.from_address)\n    END                                                                             AS from_address_norm,\n\n    -- sender_address normalized\n    CASE\n      WHEN b.sender_address IS NULL THEN NULL\n      WHEN POSITION('@' IN b.sender_address) > 0\n        THEN SPLIT_PART(SPLIT_PART(LOWER(b.sender_address),'@',1),'+',1) || '@' || LOWER(SPLIT_PART(b.sender_address,'@',2))\n      ELSE LOWER(b.sender_address)\n    END                                                                             AS sender_address_norm,\n\n    -- reply_to_address normalized\n    CASE\n      WHEN b.reply_to_address IS NULL THEN NULL\n      WHEN POSITION('@' IN b.reply_to_address) > 0\n        THEN SPLIT_PART(SPLIT_PART(LOWER(b.reply_to_address),'@',1),'+',1) || '@' || LOWER(SPLIT_PART(b.reply_to_address,'@',2))\n      ELSE LOWER(b.reply_to_address)\n    END                                                                             AS reply_to_address_norm,\n\n    -- return_path normalized from headers\n    CASE\n      WHEN b.message_id IS NULL THEN NULL\n      ELSE (\n        WITH rp AS (\n          SELECT\n            CASE\n              WHEN h.return_path IS NULL THEN NULL\n              WHEN h.return_path ~ '<.*>'\n                THEN LOWER(REGEXP_REPLACE(h.return_path, '.*<([^>]+)>.*', '\\1'))\n              ELSE LOWER(h.return_path)\n            END AS rp_clean\n          FROM outlook.email_headers h\n          WHERE h.message_id = b.message_id\n          LIMIT 1\n        )\n        SELECT CASE\n                 WHEN rp_clean IS NULL THEN NULL\n                 WHEN POSITION('@' IN rp_clean) > 0\n                   THEN SPLIT_PART(SPLIT_PART(rp_clean,'@',1),'+',1) || '@' || SPLIT_PART(rp_clean,'@',2)\n                 ELSE rp_clean\n               END\n        FROM rp\n      )\n    END                                                                             AS return_path_norm\n  FROM base b\n), features AS (\n  SELECT\n    d.message_id,\n    d.subject,\n    d.primary_category,\n    d.recommended_action,\n    d.business_relevance_score,\n    d.decided_at,\n    d.received_datetime,\n    f.feature,\n    f.key_value\n  FROM derived d\n  JOIN LATERAL (\n     VALUES\n       ('from_domain',      d.from_domain),\n       ('list_domain',      d.list_domain),\n       ('unsub_domain',     d.unsub_domain),\n       ('message_id_domain',d.message_id_domain),\n       ('precedence',       d.precedence),\n       ('auto_submitted',   d.auto_submitted),\n       ('from_address',     d.from_address_norm),\n       ('sender_address',   d.sender_address_norm),\n       ('reply_to_address', d.reply_to_address_norm),\n       ('return_path',      d.return_path_norm)\n  ) AS f(feature, key_value)\n    ON f.key_value IS NOT NULL AND f.key_value <> ''\n), stats AS (\n  SELECT COUNT(*)::int AS total_messages FROM base\n), cat_counts AS (\n  SELECT feature, key_value, primary_category, COUNT(*) cnt\n  FROM features\n  GROUP BY 1,2,3\n), cat_ranked AS (\n  SELECT feature, key_value, primary_category, cnt,\n         ROW_NUMBER() OVER (PARTITION BY feature, key_value ORDER BY cnt DESC, primary_category) rn,\n         SUM(cnt) OVER (PARTITION BY feature, key_value) support\n  FROM cat_counts\n), act_counts AS (\n  SELECT feature, key_value, COALESCE(recommended_action,'') AS recommended_action, COUNT(*) cnt\n  FROM features\n  GROUP BY 1,2,3\n), act_ranked AS (\n  SELECT feature, key_value, recommended_action, cnt,\n         ROW_NUMBER() OVER (PARTITION BY feature, key_value ORDER BY cnt DESC, recommended_action) rn\n  FROM act_counts\n), metrics AS (\n  SELECT\n    c.feature,\n    c.key_value,\n    c.support::int,\n    ROUND(100.0 * c.support / NULLIF(s.total_messages,0))::int AS coverage_pct,\n    COUNT(*) FILTER (WHERE c.cnt > 0)                          AS distinct_categories,\n    MAX(c.cnt) FILTER (WHERE c.rn = 1)::int                    AS majority_cat_count,\n    MAX(c.primary_category) FILTER (WHERE c.rn = 1)            AS majority_category,\n    MAX(a.recommended_action) FILTER (WHERE a.rn = 1)          AS majority_action,\n    MAX(a.cnt) FILTER (WHERE a.rn = 1)::int                    AS majority_action_count,\n    ROUND(100.0 * MAX(c.cnt) FILTER (WHERE c.rn = 1) / NULLIF(c.support,0))::int AS precision_cat_pct,\n    ROUND(100.0 * MAX(a.cnt) FILTER (WHERE a.rn = 1) / NULLIF(c.support,0))::int AS precision_action_pct,\n    ROUND(AVG(d.business_relevance_score) * 100)::int          AS avg_relevance_pct,\n    MIN(d.decided_at)                                          AS first_seen,\n    MAX(d.decided_at)                                          AS last_seen,\n    ARRAY(\n      SELECT DISTINCT SUBSTRING(d2.subject FROM 1 FOR 80)\n      FROM features d2\n      WHERE d2.feature = c.feature\n        AND d2.key_value = c.key_value\n        AND d2.subject IS NOT NULL\n      ORDER BY 1\n      LIMIT 10\n    )                                                          AS sample_subjects\n  FROM cat_ranked c\n  JOIN stats s ON TRUE\n  JOIN features d ON d.feature = c.feature AND d.key_value = c.key_value\n  LEFT JOIN act_ranked a ON a.feature = c.feature AND a.key_value = c.key_value\n  GROUP BY c.feature, c.key_value, c.support, s.total_messages\n)\nSELECT m.*, s.total_messages\nFROM metrics m CROSS JOIN stats s\nORDER BY support DESC, precision_cat_pct DESC, avg_relevance_pct DESC;\n",
+        "options": {
+          "connectionTimeout": 240
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -1488,
+        -928
+      ],
+      "id": "5107fce8-600a-42ee-a371-46dc3b39fba4",
+      "name": "rule_mining_agg",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const CFG = $node['set_config'].json || {};\nconst SUP_DOM = Number(CFG.MIN_SUPPORT_DOMAIN || 8);\nconst SUP_ADDR = Number(CFG.MIN_SUPPORT_ADDR || 4);\nconst SUP_HDR = Number(CFG.MIN_SUPPORT_HEADER || 6);\nconst PREC_DOM = Number(CFG.PREC_DOMAIN_MIN_PCT || 90);\nconst PREC_ADDR = Number(CFG.PREC_ADDR_MIN_PCT || 95);\nconst ACT_MIN = Number(CFG.ACTION_PREC_MIN_PCT || 75);\nconst BAND = Number(CFG.BORDERLINE_BAND_PCT || 5);\nconst MAXR = Number(CFG.MAX_RULES || 300);\n\nconst scopeMap = {\n  from_address: 'address',\n  sender_address: 'address',\n  reply_to_address: 'address',\n  return_path: 'address',\n  from_domain: 'domain',\n  list_domain: 'domain',\n  unsub_domain: 'domain',\n  message_id_domain: 'domain',\n  precedence: 'header',\n  auto_submitted: 'header'\n};\n\nfunction buildCond(feature, key) {\n  const v = String(key).replace(/'/g, \"''\");\n  switch (feature) {\n    case 'from_address':     return {dsl:`from_address:${key}`,     sql:`e.from_address = '${v}'`};\n    case 'sender_address':   return {dsl:`sender_address:${key}`,   sql:`e.sender_address = '${v}'`};\n    case 'reply_to_address': return {dsl:`reply_to_address:${key}`, sql:`e.reply_to_address = '${v}'`};\n    case 'return_path':      return {dsl:`return_path:${key}`,      sql:`EXISTS (SELECT 1 FROM outlook.email_headers h WHERE h.message_id = e.message_id AND LOWER(h.return_path) ~* '<${v}>' OR LOWER(h.return_path) = '${v}')`};\n    case 'from_domain':      return {dsl:`from_domain:${key}`,      sql:`LOWER(e.from_domain) = '${v}'`};\n    case 'list_domain':      return {dsl:`list_domain:${key}`,      sql:`LOWER(NULLIF(REGEXP_REPLACE(e.list_id,' .*<([^>]+)>.*','\\\\1'),''))\n                                                                       = '${v}'`.replace(/\\s+/g,' ')};\n    case 'unsub_domain':     return {dsl:`unsub_domain:${key}`,     sql:`e.unsubscribe_link ~* '(https?://|mailto:).*${v}'`};\n    case 'message_id_domain':return {dsl:`message_id_domain:${key}`,sql:`LOWER(NULLIF(REGEXP_REPLACE(e.message_id_header,' .*@([^>]+)>.*','\\\\1'),''))\n                                                                       = '${v}'`.replace(/\\s+/g,' ')};\n    case 'precedence':       return {dsl:`precedence:${key}`,       sql:`e.precedence = '${v}'`};\n    case 'auto_submitted':   return {dsl:`auto_submitted:${key}`,   sql:`e.auto_submitted = '${v}'`};\n    default:                 return {dsl:`${feature}:${key}`,        sql:`-- n/a --`};\n  }\n}\n\nfunction scopeThresholds(feature) {\n  const s = scopeMap[feature] || 'domain';\n  if (s === 'address') return {minSup: SUP_ADDR, minPrec: PREC_ADDR};\n  if (s === 'header')  return {minSup: SUP_HDR,  minPrec: PREC_DOM};\n  return {minSup: SUP_DOM, minPrec: PREC_DOM};\n}\n\nfunction score(r) {\n  const p = Number(r.precision_cat_pct || 0);\n  const a = Number(r.precision_action_pct || 0);\n  const rel = Number(r.avg_relevance_pct || 0);\n  const sup = Math.min(Number(r.support || 0), 200);\n  return Math.round(0.6*p + 0.2*a + 0.15*rel + 0.05*(sup/2));\n}\n\nconst rows = $input.all().map(it => it.json);\nconst total = rows[0]?.total_messages || 0;\n\nconst enriched = rows.map(r => {\n  const {dsl, sql} = buildCond(r.feature, r.key_value);\n  const sc = score(r);\n  const scope = scopeMap[r.feature] || 'domain';\n  return {...r, rule_dsl: dsl, verification_sql: sql, score: sc, rule_scope: scope};\n});\n\n// hyväksytyt\nconst accepted = enriched.filter(r => {\n  const {minSup, minPrec} = scopeThresholds(r.feature);\n  return r.support >= minSup && r.precision_cat_pct >= minPrec;\n}).sort((a,b) => b.score - a.score).slice(0, MAXR);\n\n// rajatapaukset\nconst borderline = enriched.filter(r => {\n  const {minSup, minPrec} = scopeThresholds(r.feature);\n  return r.support >= minSup &&\n         r.precision_cat_pct >= (minPrec - BAND) &&\n         r.precision_cat_pct < minPrec;\n}).sort((a,b) => b.score - a.score)\n  .slice(0, Math.max(50, Math.round(MAXR/3)));\n\nreturn [{\n  json: {\n    summary: {\n      total_messages: total,\n      thresholds: {\n        min_support_domain: SUP_DOM,\n        min_support_address: SUP_ADDR,\n        min_support_header: SUP_HDR,\n        min_precision_domain_pct: PREC_DOM,\n        min_precision_address_pct: PREC_ADDR,\n        action_precision_min_pct: ACT_MIN,\n        borderline_band_pct: BAND\n      },\n      candidates_found: enriched.length,\n      accepted_rules: accepted.length,\n      borderline_rules: borderline.length\n    },\n    accepted_rules: accepted.map(r => ({\n      feature: r.feature,\n      rule_scope: r.rule_scope,\n      key_value: r.key_value,\n      condition: r.rule_dsl,\n      category: r.majority_category,\n      category_precision_pct: r.precision_cat_pct,\n      action: r.majority_action || 'review',\n      action_precision_pct: r.precision_action_pct,\n      support: r.support,\n      coverage_pct: r.coverage_pct,\n      avg_relevance_pct: r.avg_relevance_pct,\n      first_seen: r.first_seen,\n      last_seen: r.last_seen,\n      sample_subjects: r.sample_subjects,\n      verification_sql: r.verification_sql,\n      score: r.score\n    })),\n    borderline_rules: borderline.map(r => ({\n      feature: r.feature,\n      rule_scope: r.rule_scope,\n      key_value: r.key_value,\n      condition: r.rule_dsl,\n      category: r.majority_category,\n      category_precision_pct: r.precision_cat_pct,\n      support: r.support,\n      coverage_pct: r.coverage_pct,\n      sample_subjects: r.sample_subjects,\n      verification_sql: r.verification_sql,\n      score: r.score\n    })),\n    raw_metrics: enriched\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1312,
+        -928
+      ],
+      "id": "92a9a466-1e6d-4bff-bb9d-01369d36d2ab",
+      "name": "postprocess_rules"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH inp AS (\n  SELECT\n    $1::text  AS version,\n    $2::jsonb AS rules\n),\nrows AS (\n  SELECT\n    (r->>'feature')                               AS feature,\n    (r->>'key_value')                             AS key_value,\n    COALESCE(r->>'category','uncategorized')      AS target_category,\n    COALESCE(r->>'action','review')               AS recommended_action,\n    COALESCE(r->>'rule_scope','domain')           AS scope,\n    COALESCE((r->>'priority')::int,\n      CASE\n        WHEN r->>'feature' IN ('from_address','sender_address') THEN 10\n        WHEN r->>'feature' IN ('reply_to_address')              THEN 15\n        WHEN r->>'feature' IN ('message_id_domain','list_domain','unsub_domain') THEN 20\n        WHEN r->>'feature' IN ('from_domain')                   THEN 30\n        ELSE 40\n      END\n    )                                             AS rule_priority,\n    NULLIF((r->>'support')::int,0)                AS support,\n    NULLIF((r->>'category_precision_pct')::int,0) AS precision_cat_pct,\n    NULLIF((r->>'action_precision_pct')::int,0)   AS precision_action_pct,\n    NULLIF((r->>'avg_relevance_pct')::int,0)      AS avg_relevance_pct\n  FROM inp, LATERAL jsonb_array_elements(rules) AS r\n),\nrows_filtered AS (\n  SELECT *\n  FROM rows\n  WHERE key_value IS NOT NULL AND key_value <> ''\n    AND NOT (feature = 'return_path' AND key_value LIKE 'msprvs1=%')\n    AND NOT (feature = 'message_id_domain' AND key_value LIKE 'i-%mta1vrest%.sparkpost')\n),\nupsert AS (\n  INSERT INTO outlook.classification_rules AS cr\n    (version, is_active, scope, feature, key_value, target_category, recommended_action, priority, rule_type)\n  SELECT\n    (SELECT version FROM inp), TRUE, scope, feature, key_value, target_category, recommended_action, rule_priority, 'single'\n  FROM rows_filtered\n  ON CONFLICT (version, feature, key_value) DO UPDATE\n    SET target_category    = EXCLUDED.target_category,\n        recommended_action = EXCLUDED.recommended_action,\n        priority           = EXCLUDED.priority,\n        is_active          = TRUE,\n        rule_type          = 'single'\n  RETURNING cr.id, cr.feature, cr.key_value\n),\nmetrics_del AS (\n  DELETE FROM outlook.classification_rule_metrics m\n  USING upsert u\n  WHERE m.rule_id = u.id\n  RETURNING m.rule_id\n)\nINSERT INTO outlook.classification_rule_metrics\n  (rule_id, support, precision_cat_pct, precision_action_pct, avg_relevance_pct)\nSELECT u.id, r.support, r.precision_cat_pct, r.precision_action_pct, r.avg_relevance_pct\nFROM upsert u\nJOIN rows_filtered r USING (feature, key_value);\n",
+        "options": {
+          "connectionTimeout": 120,
+          "queryReplacement": "={{ [ $json.version, JSON.stringify($json.rules_json || []) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -960,
+        -880
+      ],
+      "id": "dd320d7a-d9d4-4b40-b8c2-e07a2ed9c85c",
+      "name": "publish_rules_from_cda",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: postprocess_rules.item.json (sisältää accepted_rules)\n// Output: { version, rules_json, kept_count, dropped_count }\n\nconst src = $json;\nconst rules = Array.isArray(src.accepted_rules) ? src.accepted_rules : [];\n\nconst ALLOWED = new Set([\n  'from_address','sender_address','reply_to_address',\n  'from_domain','message_id_domain','list_domain','unsub_domain'\n]);\n\nconst isUnstable = (feature, key) => {\n  if (feature === 'return_path') return true; // pudota aina\n  if (feature === 'message_id_domain' &&\n      /(^i-[0-9a-f]+.*\\.mta1vrest\\.sd\\.prd\\.sparkpost$)/i.test(key)) return true;\n  return false;\n};\n\nconst featurePriority = (f) => {\n  if (f === 'from_address' || f === 'sender_address') return 10;\n  if (f === 'reply_to_address') return 15;\n  if (f === 'message_id_domain' || f === 'list_domain' || f === 'unsub_domain') return 20;\n  if (f === 'from_domain') return 30;\n  return 40;\n};\n\nconst seen = new Set();\nconst kept = [];\nlet dropped = 0;\n\nfor (const r of rules) {\n  const feature = String(r.feature || '').trim();\n  const key = String(r.key_value || '').trim();\n  if (!feature || !key) { dropped++; continue; }\n  if (!ALLOWED.has(feature)) { dropped++; continue; }\n  if (isUnstable(feature, key)) { dropped++; continue; }\n\n  const k = feature + '|' + key;\n  if (seen.has(k)) { dropped++; continue; }\n  seen.add(k);\n\n  kept.push({\n    feature,\n    key_value: key,\n    rule_scope: r.rule_scope || 'domain',\n    category: r.category || r.target_category || 'uncategorized',\n    action: r.action || r.recommended_action || 'review',\n    priority: Number.isInteger(r.priority) ? r.priority : featurePriority(feature),\n    // (valinnaiset metriikat voi välittää jos haluat niitä metrics-tauluun)\n    support: r.support ?? null,\n    category_precision_pct: r.category_precision_pct ?? null,\n    action_precision_pct: r.action_precision_pct ?? null,\n    avg_relevance_pct: r.avg_relevance_pct ?? null,\n  });\n}\n\nconst iso = new Date().toISOString().slice(0,19).replace(/:/g,'-');\nconst version = `cda_${iso}`;\n\nreturn [{\n  version,\n  rules_json: kept,     // <<< TÄMÄ on oleellista\n  kept_count: kept.length,\n  dropped_count: dropped\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1152,
+        -928
+      ],
+      "id": "c2d46d0e-44ed-44a6-879a-9348f02d3ecb",
+      "name": "prep_rules_payload",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "TRUNCATE TABLE\n  outlook.classification_rule_metrics,\n  outlook.classification_rules\nRESTART IDENTITY CASCADE;",
+        "options": {
+          "connectionTimeout": 120,
+          "queryReplacement": "={{ [ $json.version, JSON.stringify($json.rules_json || []) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -960,
+        -1056
+      ],
+      "id": "04c20a4b-adb5-4648-b5b2-dc9d7b055623",
+      "name": "reset_rules_table",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH latest AS (\n  SELECT version\n  FROM outlook.classification_rules\n  WHERE is_active = TRUE\n  ORDER BY created_at DESC\n  LIMIT 1\n),\nrules AS (\n  SELECT *\n  FROM outlook.classification_rules\n  WHERE is_active = TRUE\n    AND version = (SELECT version FROM latest)\n),\ncounts AS (\n  SELECT\n    (SELECT version FROM latest)                                  AS version,\n    COUNT(*)                                                      AS total_rules,\n    COUNT(*) FILTER (WHERE rule_type = 'single')                  AS single_rules,\n    COUNT(*) FILTER (WHERE rule_type = 'composite')               AS composite_rules,\n    COUNT(*) FILTER (WHERE feature IN ('from_address','sender_address','reply_to_address')) AS address_rules,\n    COUNT(*) FILTER (WHERE feature IN ('from_domain','list_domain','unsub_domain','message_id_domain')) AS domain_header_rules\n  FROM rules\n),\ndups AS (\n  SELECT feature, key_value, COUNT(*) AS cnt\n  FROM rules\n  GROUP BY feature, key_value\n  HAVING COUNT(*) > 1\n),\nfragile AS (\n  SELECT id, feature, key_value\n  FROM rules\n  WHERE (feature = 'return_path' AND key_value LIKE 'msprvs1=%')\n     OR (feature = 'message_id_domain' AND key_value LIKE 'i-%mta1vrest%')\n),\nsamples AS (\n  SELECT rule_type, feature, key_value, target_category, recommended_action, priority\n  FROM rules\n  ORDER BY priority, feature, key_value\n  LIMIT 20\n)\nSELECT 'summary'         AS section, to_jsonb(c.*)        AS data FROM counts c\nUNION ALL\nSELECT 'latest_version'  AS section, to_jsonb(l.*)        AS data FROM latest l\nUNION ALL\nSELECT 'duplicates'      AS section, COALESCE(jsonb_agg(to_jsonb(d.*)),'[]'::jsonb) AS data FROM dups d\nUNION ALL\nSELECT 'fragile'         AS section, COALESCE(jsonb_agg(to_jsonb(f.*)),'[]'::jsonb) AS data FROM fragile f\nUNION ALL\nSELECT 'sample'          AS section, COALESCE(jsonb_agg(to_jsonb(s.*)),'[]'::jsonb) AS data FROM samples s;\n",
+        "options": {
+          "connectionTimeout": 120,
+          "queryReplacement": "={{ [ $json.version ] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -784,
+        -880
+      ],
+      "id": "fea1becf-40d7-4322-94b2-693dfda35f3a",
+      "name": "verify_rules",
+      "notesInFlow": true,
+      "credentials": {
+        "postgres": {
+          "id": "4rl59kH75QNg0oSk",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "set_config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "set_config": {
+      "main": [
+        [
+          {
+            "node": "rule_mining_agg",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "rule_mining_agg": {
+      "main": [
+        [
+          {
+            "node": "postprocess_rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "postprocess_rules": {
+      "main": [
+        [
+          {
+            "node": "prep_rules_payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "publish_rules_from_cda": {
+      "main": [
+        [
+          {
+            "node": "verify_rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prep_rules_payload": {
+      "main": [
+        [
+          {
+            "node": "reset_rules_table",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "publish_rules_from_cda",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "reset_rules_table": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Start": [
+      {}
+    ]
+  },
+  "meta": {
+    "instanceId": "5bc588890427261aec904f1de6ea2c47f92f0021d7680fbf9bd2043a6f4924b2"
+  }
+}
