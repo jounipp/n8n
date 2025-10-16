@@ -1,0 +1,7 @@
+sources:
+  - Outlook/.codecs/docs/ARCHITECTURE.md
+  - Outlook/.codecs/docs/INSTRUCTIONS.md
+  - Outlook/.codecs/docs/CONVENTIONS.md
+  - Outlook/.codecs/docs/WORKFLOWS.md
+memory:
+  policy: Outlook/.codecs/policies/MEMORY_POLICY.md
