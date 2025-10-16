@@ -5,3 +5,6 @@ sources:
   - Outlook/.codecs/docs/WORKFLOWS.md
 memory:
   policy: Outlook/.codecs/policies/MEMORY_POLICY.md
+budgets:
+  max_context_tokens: 2000
+  reserve_completion_tokens: 1500
