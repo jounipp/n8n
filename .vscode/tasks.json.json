@@ -1,0 +1,13 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Codex: Outlook",
+      "type": "shell",
+      "command": "codex",
+      "options": { "cwd": "${workspaceFolder}/Outlook" },
+      "problemMatcher": []
+    }
+  ]
+}
+
